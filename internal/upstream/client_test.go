@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -94,6 +95,38 @@ func TestCreateAndAddMessageWireFormat(t *testing.T) {
 		if _, ok := body["filteredEdgeTools"].(map[string]any); !ok {
 			t.Fatalf("%s filteredEdgeTools = %#v", name, body["filteredEdgeTools"])
 		}
+	}
+}
+
+func TestMessagesDecodesRunMeta(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/todos/todo-1/messages" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{
+			"messages":[{
+				"id":"message-1","role":"assistant","content":"","blocks":[{"type":"text","content":"hello"}],
+				"runMeta":[{
+					"type":"todo:msg_meta_ai",
+					"extras":{"model":"openai:openai/gpt-5.6-sol","inputTokens":852,"outputTokens":11,"cacheReadTokens":1536,"cacheWriteTokens":64,"contextTokens":2463}
+				}]
+			}],
+			"hasMore":false
+		}`)
+	}))
+	defer server.Close()
+
+	messages, err := New(server.URL+"/api/v1", "upstream-key").Messages(context.Background(), "todo-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || len(messages[0].RunMeta) != 1 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	extras := messages[0].RunMeta[0].Extras
+	if extras.InputTokens != 852 || extras.OutputTokens != 11 || extras.CacheReadTokens != 1536 || extras.CacheWriteTokens != 64 || extras.ContextTokens != 2463 {
+		t.Fatalf("runMeta extras = %#v", extras)
 	}
 }
 

@@ -62,8 +62,10 @@ func TestAnthropicRequestConvertsToolHistory(t *testing.T) {
 }
 
 func TestAnthropicResponseAndStreamToolUse(t *testing.T) {
+	usage := exactTestUsage()
+	usage.CacheWriteTokens = 64
 	reply := &gateway.Reply{
-		Model: "resolved-model", TodoID: "todo-1", Content: "Using a tool.",
+		Model: "resolved-model", TodoID: "todo-1", Content: "Using a tool.", Usage: usage,
 		ToolCalls: []openai.ToolCall{{
 			ID: "toolu_1", Type: "function",
 			Function: openai.FunctionCall{Name: "read_file", Arguments: `{"path":"a.txt"}`},
@@ -75,6 +77,9 @@ func TestAnthropicResponseAndStreamToolUse(t *testing.T) {
 	}
 	if len(response.Content) != 2 || response.Content[1].Name != "read_file" {
 		t.Fatalf("content = %#v", response.Content)
+	}
+	if response.Usage.InputTokens != 852 || response.Usage.CacheReadInputTokens != 1536 || response.Usage.CacheCreationInputTokens != 64 || response.Usage.OutputTokens != 11 {
+		t.Fatalf("usage = %#v", response.Usage)
 	}
 	var input map[string]string
 	if err := json.Unmarshal(response.Content[1].Input, &input); err != nil || input["path"] != "a.txt" {
@@ -103,6 +108,10 @@ func TestAnthropicResponseAndStreamToolUse(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("stream does not contain %q:\n%s", want, body)
 		}
+	}
+	deltaUsage := anthropicUsageEvent(t, body, "message_delta")
+	if deltaUsage.InputTokens != 852 || deltaUsage.CacheReadInputTokens != 1536 || deltaUsage.CacheCreationInputTokens != 64 || deltaUsage.OutputTokens != 11 {
+		t.Fatalf("message_delta usage = %#v", deltaUsage)
 	}
 }
 
@@ -159,4 +168,25 @@ func TestAnthropicMisspellingAndAPIKeyAuth(t *testing.T) {
 	if response["input_tokens"] <= 0 || recorder.Header().Get("X-Todo2API-Token-Estimate") != "true" {
 		t.Fatalf("response = %#v, headers = %#v", response, recorder.Header())
 	}
+}
+
+func anthropicUsageEvent(t *testing.T, body, eventType string) anthropicUsage {
+	t.Helper()
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event struct {
+			Type  string         `json:"type"`
+			Usage anthropicUsage `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			t.Fatalf("decode Anthropic event %q: %v", line, err)
+		}
+		if event.Type == eventType {
+			return event.Usage
+		}
+	}
+	t.Fatalf("event %q not found in:\n%s", eventType, body)
+	return anthropicUsage{}
 }

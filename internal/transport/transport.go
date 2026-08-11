@@ -156,14 +156,34 @@ func buildResponse(reply *gateway.Reply) openai.ChatResponse {
 		Created: time.Now().Unix(),
 		Model:   reply.Model,
 		Choices: []openai.Choice{choice},
+		Usage:   chatUsage(reply.Usage),
 		Metadata: map[string]string{
 			openai.TodoIDMetadataKey: reply.TodoID,
 		},
 	}
 }
 
+func chatUsage(usage gateway.TokenUsage) *openai.Usage {
+	if !usage.Available {
+		return nil
+	}
+	promptTokens := usage.InputTokens + usage.CacheReadTokens + usage.CacheWriteTokens
+	return &openai.Usage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: usage.OutputTokens,
+		TotalTokens:      promptTokens + usage.OutputTokens,
+		PromptTokensDetails: &openai.PromptTokensDetails{
+			CachedTokens: usage.CacheReadTokens,
+		},
+		CompletionTokensDetails: &openai.CompletionTokensDetails{},
+	}
+}
+
 func (s *Server) streamChat(w http.ResponseWriter, flusher http.Flusher, ctx context.Context, req openai.ChatRequest) {
-	stream := &chatSSE{w: w, flusher: flusher}
+	stream := &chatSSE{
+		w: w, flusher: flusher,
+		includeUsage: req.StreamOptions != nil && req.StreamOptions.IncludeUsage,
+	}
 	reply, err := s.gw.Stream(ctx, req, stream.onGatewayEvent)
 	if err != nil {
 		if !stream.started {
@@ -178,13 +198,14 @@ func (s *Server) streamChat(w http.ResponseWriter, flusher http.Flusher, ctx con
 }
 
 type chatSSE struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	id      string
-	created int64
-	model   string
-	todoID  string
-	started bool
+	w            http.ResponseWriter
+	flusher      http.Flusher
+	id           string
+	created      int64
+	model        string
+	todoID       string
+	started      bool
+	includeUsage bool
 }
 
 func (s *chatSSE) onGatewayEvent(event gateway.StreamEvent) error {
@@ -217,12 +238,16 @@ func (s *chatSSE) start(model, todoID string) error {
 }
 
 func (s *chatSSE) emit(choice openai.Choice) error {
+	return s.emitChunk([]openai.Choice{choice}, nil)
+}
+
+func (s *chatSSE) emitChunk(choices []openai.Choice, usage *openai.Usage) error {
 	if !s.started {
 		return fmt.Errorf("chat stream has not started")
 	}
 	chunk := openai.ChatResponse{
 		ID: s.id, Object: "chat.completion.chunk", Created: s.created,
-		Model: s.model, Choices: []openai.Choice{choice},
+		Model: s.model, Choices: choices, Usage: usage,
 		Metadata: map[string]string{openai.TodoIDMetadataKey: s.todoID},
 	}
 	b, err := json.Marshal(chunk)
@@ -255,6 +280,13 @@ func (s *chatSSE) finish(reply *gateway.Reply) error {
 		stop := "stop"
 		if err := s.emit(openai.Choice{Index: 0, Delta: &openai.Delta{}, FinishReason: &stop}); err != nil {
 			return err
+		}
+	}
+	if s.includeUsage {
+		if usage := chatUsage(reply.Usage); usage != nil {
+			if err := s.emitChunk([]openai.Choice{}, usage); err != nil {
+				return err
+			}
 		}
 	}
 	return s.done()

@@ -20,6 +20,22 @@ type Block struct {
 	Status  string `json:"status"`
 }
 
+// RunMeta records one measured operation attached to an upstream message.
+type RunMeta struct {
+	Type   string        `json:"type"`
+	Extras RunMetaExtras `json:"extras"`
+}
+
+// RunMetaExtras contains the token counters reported for an AI operation.
+type RunMetaExtras struct {
+	Model            string `json:"model"`
+	InputTokens      int    `json:"inputTokens"`
+	OutputTokens     int    `json:"outputTokens"`
+	CacheReadTokens  int    `json:"cacheReadTokens"`
+	CacheWriteTokens int    `json:"cacheWriteTokens"`
+	ContextTokens    int    `json:"contextTokens"`
+}
+
 // AddMessage resumes an existing todo with a user/tool-result message.
 func (c *Client) AddMessage(ctx context.Context, projectID, todoID, content string, agent AgentSettings, filteredTools ...FilteredEdgeTools) (*Todo, error) {
 	body := createTodoReq{
@@ -128,11 +144,12 @@ type Todo struct {
 }
 
 type Message struct {
-	ID        string  `json:"id"`
-	Role      string  `json:"role"`
-	Content   string  `json:"content"`
-	CreatedAt int64   `json:"createdAt"`
-	Blocks    []Block `json:"blocks"`
+	ID        string    `json:"id"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	CreatedAt int64     `json:"createdAt"`
+	Blocks    []Block   `json:"blocks"`
+	RunMeta   []RunMeta `json:"runMeta"`
 }
 
 type messagesResp struct {

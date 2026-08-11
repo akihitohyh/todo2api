@@ -20,6 +20,7 @@ allowing the upstream agent to execute local device tools itself.
 - In-memory continuation by canonical history hash
 - `todoId` continuation fallback through response metadata or HTTP headers
 - Optional Edge MCP discovery and `filteredEdgeTools` forwarding
+- Exact per-turn token usage from upstream assistant `runMeta`
 
 For streaming requests, each upstream `block:message` fragment is flushed to
 the downstream connection as it arrives. Client-side tool protocol blocks are
@@ -50,6 +51,7 @@ Upstream requests use `X-API-Key`. The frontend event flow is:
    `todo:status` values such as `READY`, `READY_CHECKED`, or `DONE`.
 5. Read `GET /todos/{todoId}/messages` for the authoritative final assistant
    message.
+6. Map its AI `runMeta` counters into the requested API's usage schema.
 
 This was checked against the current public
 [OpenAPI document](https://api.todofor.ai/openapi.json) and the official
@@ -111,8 +113,14 @@ Incremental Chat Completions stream:
 curl --no-buffer http://localhost:8080/v1/chat/completions \
   -H 'Authorization: Bearer sk-todo2api-changeme' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"Write a detailed answer in several paragraphs."}]}'
+  -d '{"model":"gpt-5.6-sol","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Write a detailed answer in several paragraphs."}]}'
 ```
+
+With `stream_options.include_usage`, Chat Completions emits the standard final
+usage-only chunk with an empty `choices` array before `[DONE]`. Responses places
+usage on the completed response event, while Anthropic Messages places it on
+the final `message_delta`. `/v1/messages/count_tokens` remains an estimate
+because it runs before an upstream assistant message exists.
 
 Responses request:
 
@@ -216,11 +224,11 @@ go build ./cmd/todo2api
 Tests include an HTTP/WebSocket mock of the official subscription protocol,
 pre-terminal delta timing, split tool-tag filtering, cancellation, tool-call
 continuation, Responses Item/SSE conversion, Anthropic content/SSE conversion,
-and account-pool selection. Live account verification still requires a valid
-todofor.ai API key; use `examples/tool_call_curl.sh` as the account-level probe.
+exact `runMeta` usage mapping, and account-pool selection. Live account
+verification still requires a valid todofor.ai API key; use
+`examples/tool_call_curl.sh` as the account-level probe.
 
 ## Remaining work
 
 1. Persist session references with TTLs and authenticated resume tokens.
-2. Populate OpenAI usage fields from upstream `runMeta` data.
-3. Add broader compatibility for multimodal OpenAI message content.
+2. Add broader compatibility for multimodal OpenAI message content.

@@ -131,7 +131,7 @@ type responsesResponse struct {
 	Text               any                   `json:"text"`
 	TopP               *float64              `json:"top_p"`
 	Truncation         string                `json:"truncation"`
-	Usage              responsesUsage        `json:"usage"`
+	Usage              *responsesUsage       `json:"usage"`
 }
 
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
@@ -467,7 +467,7 @@ func buildResponsesResponse(req responsesRequest, reply *gateway.Reply, toolTarg
 		Metadata: metadata, Reasoning: map[string]any{"effort": nil, "summary": nil},
 		Store:      req.Store == nil || *req.Store,
 		Text:       map[string]any{"format": map[string]string{"type": "text"}},
-		Truncation: "disabled", Usage: responsesUsage{},
+		Truncation: "disabled", Usage: responseUsage(reply.Usage),
 	}
 	if req.ParallelToolCalls != nil {
 		response.ParallelToolCalls = *req.ParallelToolCalls
@@ -521,6 +521,22 @@ func buildResponsesResponse(req responsesRequest, reply *gateway.Reply, toolTarg
 		response.Output = append(response.Output, item)
 	}
 	return response
+}
+
+func responseUsage(usage gateway.TokenUsage) *responsesUsage {
+	if !usage.Available {
+		return nil
+	}
+	inputTokens := usage.InputTokens + usage.CacheReadTokens + usage.CacheWriteTokens
+	return &responsesUsage{
+		InputTokens: inputTokens,
+		InputTokensDetails: responsesInputTokenDetails{
+			CachedTokens: usage.CacheReadTokens,
+		},
+		OutputTokens:        usage.OutputTokens,
+		OutputTokensDetails: responsesOutputTokenDetails{},
+		TotalTokens:         inputTokens + usage.OutputTokens,
+	}
 }
 
 func responseToolTarget(name string, targets map[string]responsesToolTarget) responsesToolTarget {
@@ -624,6 +640,7 @@ func (s *responsesSSE) start(model, todoID string) error {
 	inProgress.Status = "in_progress"
 	inProgress.Output = []responsesOutputItem{}
 	inProgress.OutputText = ""
+	inProgress.Usage = nil
 	if err := s.emit("response.created", map[string]any{"response": inProgress}); err != nil {
 		return err
 	}

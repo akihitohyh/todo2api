@@ -2,6 +2,7 @@ package transport
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,7 @@ func TestBuildResponseIncludesToolCallAndTodoMetadata(t *testing.T) {
 	reply := &gateway.Reply{
 		Model:  "resolved-model",
 		TodoID: "todo-1",
+		Usage:  exactTestUsage(),
 		ToolCalls: []openai.ToolCall{{
 			ID:       "call-1",
 			Type:     "function",
@@ -28,6 +30,12 @@ func TestBuildResponseIncludesToolCallAndTodoMetadata(t *testing.T) {
 	}
 	if got := *resp.Choices[0].FinishReason; got != "tool_calls" {
 		t.Fatalf("finish reason = %q", got)
+	}
+	if resp.Usage == nil || resp.Usage.PromptTokens != 2388 || resp.Usage.CompletionTokens != 11 || resp.Usage.TotalTokens != 2399 {
+		t.Fatalf("usage = %#v", resp.Usage)
+	}
+	if resp.Usage.PromptTokensDetails == nil || resp.Usage.PromptTokensDetails.CachedTokens != 1536 {
+		t.Fatalf("prompt token details = %#v", resp.Usage.PromptTokensDetails)
 	}
 }
 
@@ -100,6 +108,52 @@ func TestChatSSEWritesEachDeltaBeforeFinish(t *testing.T) {
 	}
 }
 
+func TestChatSSEUsageChunkRequiresIncludeUsage(t *testing.T) {
+	for _, includeUsage := range []bool{false, true} {
+		t.Run(fmt.Sprint(includeUsage), func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			stream := &chatSSE{w: recorder, flusher: recorder, includeUsage: includeUsage}
+			if err := stream.start("resolved-model", "todo-1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := stream.finish(&gateway.Reply{
+				Model: "resolved-model", TodoID: "todo-1", Usage: exactTestUsage(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			usageChunks := 0
+			for _, chunk := range decodeChatChunks(t, recorder.Body.String()) {
+				if chunk.Usage == nil {
+					continue
+				}
+				usageChunks++
+				if len(chunk.Choices) != 0 || chunk.Usage.PromptTokens != 2388 || chunk.Usage.CompletionTokens != 11 || chunk.Usage.TotalTokens != 2399 {
+					t.Fatalf("usage chunk = %#v", chunk)
+				}
+			}
+			want := 0
+			if includeUsage {
+				want = 1
+			}
+			if usageChunks != want {
+				t.Fatalf("usage chunks = %d, want %d; stream:\n%s", usageChunks, want, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestUnavailableChatUsageIsOmitted(t *testing.T) {
+	response := buildResponse(&gateway.Reply{Model: "model", TodoID: "todo-1"})
+	b, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"usage"`) {
+		t.Fatalf("unavailable usage was serialized: %s", b)
+	}
+}
+
 func TestModelsIncludesDefaultAndIsSorted(t *testing.T) {
 	s := &Server{cfg: &config.Config{Models: config.ModelsConfig{
 		Default: "model-default",
@@ -124,4 +178,26 @@ func TestModelsIncludesDefaultAndIsSorted(t *testing.T) {
 			t.Fatalf("model[%d] = %q, want %q", i, model.ID, want[i])
 		}
 	}
+}
+
+func exactTestUsage() gateway.TokenUsage {
+	return gateway.TokenUsage{
+		InputTokens: 852, OutputTokens: 11, CacheReadTokens: 1536, Available: true,
+	}
+}
+
+func decodeChatChunks(t *testing.T, body string) []openai.ChatResponse {
+	t.Helper()
+	var chunks []openai.ChatResponse
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+			continue
+		}
+		var chunk openai.ChatResponse
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err != nil {
+			t.Fatalf("decode chunk %q: %v", line, err)
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks
 }

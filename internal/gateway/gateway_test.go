@@ -17,6 +17,7 @@ import (
 	"todo2api/internal/openai"
 	"todo2api/internal/pool"
 	"todo2api/internal/session"
+	"todo2api/internal/upstream"
 )
 
 func TestCompleteToolCallContinuationAndMetadataFallback(t *testing.T) {
@@ -77,6 +78,11 @@ func TestCompleteToolCallContinuationAndMetadataFallback(t *testing.T) {
 	if first.Model != "public-model" {
 		t.Fatalf("public response model = %q", first.Model)
 	}
+	if first.Usage != (TokenUsage{
+		InputTokens: 852, OutputTokens: 11, CacheReadTokens: 1536, Available: true,
+	}) {
+		t.Fatalf("first usage = %#v", first.Usage)
+	}
 
 	secondReq := openai.ChatRequest{
 		Model: "public-model",
@@ -93,6 +99,9 @@ func TestCompleteToolCallContinuationAndMetadataFallback(t *testing.T) {
 	}
 	if second.Content != "The file says hello." || second.IsToolCall() {
 		t.Fatalf("second reply = %#v", second)
+	}
+	if second.Usage.InputTokens != 852 || second.Usage.OutputTokens != 11 || !second.Usage.Available {
+		t.Fatalf("continuation usage = %#v", second.Usage)
 	}
 
 	thirdReq := openai.ChatRequest{
@@ -254,9 +263,24 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 			m.prematureFetch = true
 		}
 		json.NewEncoder(w).Encode(map[string]any{
-			"messages": []map[string]any{{
-				"id": "assistant-message", "todoId": "todo-1", "role": "assistant", "content": m.assistantContent,
-			}},
+			"messages": []map[string]any{
+				{
+					"id": "older-assistant-message", "todoId": "todo-1", "role": "assistant", "content": "old reply",
+					"runMeta": []map[string]any{{
+						"type":   "todo:msg_meta_ai",
+						"extras": map[string]any{"inputTokens": 9999, "outputTokens": 9999, "cacheReadTokens": 9999},
+					}},
+				},
+				{
+					"id": "assistant-message", "todoId": "todo-1", "role": "assistant", "content": m.assistantContent,
+					"runMeta": []map[string]any{{
+						"type": "todo:msg_meta_ai",
+						"extras": map[string]any{
+							"inputTokens": 852, "outputTokens": 11, "cacheReadTokens": 1536, "contextTokens": 2399,
+						},
+					}},
+				},
+			},
 			"hasMore": false,
 		})
 	})
@@ -521,6 +545,40 @@ func TestConversationKeyIncludesToolCalls(t *testing.T) {
 	})
 	if strings.EqualFold(conversationKey(withRead), conversationKey(withWrite)) {
 		t.Fatal("conversation key ignored tool calls")
+	}
+}
+
+func TestTokenUsageAggregatesOnlyAIMetadata(t *testing.T) {
+	usage := tokenUsage([]upstream.RunMeta{
+		{
+			Type: "todo:msg_meta_ai",
+			Extras: upstream.RunMetaExtras{
+				InputTokens: 800, OutputTokens: 10, CacheReadTokens: 1500,
+				CacheWriteTokens: 60, ContextTokens: 999999,
+			},
+		},
+		{
+			Type: "todo:msg_meta_tool",
+			Extras: upstream.RunMetaExtras{
+				InputTokens: 5000, OutputTokens: 5000, CacheReadTokens: 5000,
+			},
+		},
+		{
+			Type: "todo:msg_meta_ai",
+			Extras: upstream.RunMetaExtras{
+				InputTokens: 52, OutputTokens: 1, CacheReadTokens: 36, CacheWriteTokens: 4,
+			},
+		},
+	})
+	want := TokenUsage{
+		InputTokens: 852, OutputTokens: 11, CacheReadTokens: 1536,
+		CacheWriteTokens: 64, Available: true,
+	}
+	if usage != want {
+		t.Fatalf("usage = %#v, want %#v", usage, want)
+	}
+	if missing := tokenUsage(nil); missing.Available {
+		t.Fatalf("missing metadata reported available: %#v", missing)
 	}
 }
 

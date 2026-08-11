@@ -3,11 +3,16 @@ package openai
 import "encoding/json"
 
 type ChatRequest struct {
-	Model    string            `json:"model"`
-	Messages []ChatMessage     `json:"messages"`
-	Stream   bool              `json:"stream"`
-	Tools    []Tool            `json:"tools,omitempty"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	Model         string            `json:"model"`
+	Messages      []ChatMessage     `json:"messages"`
+	Stream        bool              `json:"stream"`
+	StreamOptions *StreamOptions    `json:"stream_options,omitempty"`
+	Tools         []Tool            `json:"tools,omitempty"`
+	Metadata      map[string]string `json:"metadata,omitempty"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type Tool struct {
@@ -50,7 +55,7 @@ type ChatResponse struct {
 	Created  int64             `json:"created"`
 	Model    string            `json:"model"`
 	Choices  []Choice          `json:"choices"`
-	Usage    Usage             `json:"usage"`
+	Usage    *Usage            `json:"usage,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
@@ -70,9 +75,19 @@ type Delta struct {
 }
 
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 type ModelList struct {

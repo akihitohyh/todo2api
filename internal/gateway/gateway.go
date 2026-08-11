@@ -32,9 +32,21 @@ type Reply struct {
 	ToolCalls []openai.ToolCall
 	Model     string
 	TodoID    string
+	Usage     TokenUsage
 }
 
 func (r *Reply) IsToolCall() bool { return len(r.ToolCalls) > 0 }
+
+// TokenUsage is the exact per-turn usage reported by the upstream assistant
+// message. Available is false when the authoritative message metadata could
+// not be read; callers must not replace missing usage with an estimate.
+type TokenUsage struct {
+	InputTokens      int
+	OutputTokens     int
+	CacheReadTokens  int
+	CacheWriteTokens int
+	Available        bool
+}
 
 // Models returns short discovered IDs plus configured public aliases.
 // Configured aliases take precedence when IDs overlap.
@@ -195,10 +207,11 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 			})
 		}
 	}
-	content, err := g.waitAssistant(runCtx, sub, acc.Client, todoID, emitText)
+	result, err := g.waitAssistant(runCtx, sub, acc.Client, todoID, emitText)
 	if err != nil {
 		return nil, err
 	}
+	content := result.Content
 	text, calls := openai.ParseToolCalls(content)
 
 	assistant := openai.ChatMessage{Role: "assistant", Content: content}
@@ -223,9 +236,11 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 	}
 
 	if len(calls) > 0 {
-		return &Reply{Content: text, ToolCalls: calls, Model: publicModel, TodoID: todoID}, nil
+		return &Reply{
+			Content: text, ToolCalls: calls, Model: publicModel, TodoID: todoID, Usage: result.Usage,
+		}, nil
 	}
-	return &Reply{Content: content, Model: publicModel, TodoID: todoID}, nil
+	return &Reply{Content: content, Model: publicModel, TodoID: todoID, Usage: result.Usage}, nil
 }
 
 func (g *Gateway) resolveModel(requested string) string {
@@ -345,7 +360,7 @@ func (g *Gateway) waitAssistant(
 	cli *upstream.Client,
 	todoID string,
 	emit func(string) error,
-) (string, error) {
+) (assistantResult, error) {
 	events := make(chan upstream.Event, 32)
 	errc := make(chan error, 1)
 	go func() { errc <- sub.Subscribe(ctx, todoID, events) }()
@@ -373,7 +388,7 @@ func (g *Gateway) waitAssistant(
 				if emit != nil {
 					if delta := filter.Push(payload.Content); delta != "" {
 						if err := emit(delta); err != nil {
-							return "", fmt.Errorf("emit stream text: %w", err)
+							return assistantResult{}, fmt.Errorf("emit stream text: %w", err)
 						}
 					}
 				}
@@ -395,25 +410,30 @@ func (g *Gateway) waitAssistant(
 					}
 					return finishAssistant(ctx, cli, todoID, buf.String(), &filter, emit)
 				case "CANCELLED", "CANCELLED_CHECKED", "ERROR", "ERROR_CHECKED":
-					return "", fmt.Errorf("upstream todo %s ended with status %s", todoID, payload.Status)
+					return assistantResult{}, fmt.Errorf("upstream todo %s ended with status %s", todoID, payload.Status)
 				}
 			}
 		case err := <-errc:
 			if ctx.Err() != nil {
-				return "", assistantWaitError(ctx)
+				return assistantResult{}, assistantWaitError(ctx)
 			}
-			content, restErr := finishAssistant(ctx, cli, todoID, buf.String(), &filter, emit)
+			result, restErr := finishAssistant(ctx, cli, todoID, buf.String(), &filter, emit)
 			if restErr != nil {
-				return "", restErr
+				return assistantResult{}, restErr
 			}
-			if content == "" && err != nil {
-				return "", err
+			if result.Content == "" && err != nil {
+				return assistantResult{}, err
 			}
-			return content, nil
+			return result, nil
 		case <-ctx.Done():
-			return "", assistantWaitError(ctx)
+			return assistantResult{}, assistantWaitError(ctx)
 		}
 	}
+}
+
+type assistantResult struct {
+	Content string
+	Usage   TokenUsage
 }
 
 func finishAssistant(
@@ -423,31 +443,31 @@ func finishAssistant(
 	streamed string,
 	filter *openai.ToolCallStreamFilter,
 	emit func(string) error,
-) (string, error) {
-	content, err := finalAssistant(ctx, cli, todoID, streamed)
+) (assistantResult, error) {
+	result, err := finalAssistant(ctx, cli, todoID, streamed)
 	if err != nil {
-		return "", err
+		return assistantResult{}, err
 	}
 	if emit == nil {
-		return content, nil
+		return result, nil
 	}
 
 	// REST is authoritative at completion. Only append a missing suffix when it
 	// agrees with everything already received over the WebSocket; emitted bytes
 	// cannot be retracted when the two sources diverge.
-	if strings.HasPrefix(content, streamed) {
-		if delta := filter.Push(content[len(streamed):]); delta != "" {
+	if strings.HasPrefix(result.Content, streamed) {
+		if delta := filter.Push(result.Content[len(streamed):]); delta != "" {
 			if err := emit(delta); err != nil {
-				return "", fmt.Errorf("emit final stream text: %w", err)
+				return assistantResult{}, fmt.Errorf("emit final stream text: %w", err)
 			}
 		}
 	}
 	if tail := filter.Flush(); tail != "" {
 		if err := emit(tail); err != nil {
-			return "", fmt.Errorf("flush stream text: %w", err)
+			return assistantResult{}, fmt.Errorf("flush stream text: %w", err)
 		}
 	}
-	return content, nil
+	return result, nil
 }
 
 func assistantWaitError(ctx context.Context) error {
@@ -457,20 +477,22 @@ func assistantWaitError(ctx context.Context) error {
 	return fmt.Errorf("waiting for assistant reply: %w", ctx.Err())
 }
 
-func finalAssistant(ctx context.Context, cli *upstream.Client, todoID, fallback string) (string, error) {
+func finalAssistant(ctx context.Context, cli *upstream.Client, todoID, fallback string) (assistantResult, error) {
 	msgs, err := cli.Messages(ctx, todoID)
 	if err != nil {
 		if fallback != "" {
-			return fallback, nil
+			return assistantResult{Content: fallback}, nil
 		}
-		return "", err
+		return assistantResult{}, err
 	}
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role != "assistant" {
 			continue
 		}
+		result := assistantResult{Usage: tokenUsage(msgs[i].RunMeta)}
 		if msgs[i].Content != "" {
-			return msgs[i].Content, nil
+			result.Content = msgs[i].Content
+			return result, nil
 		}
 		var b strings.Builder
 		for _, block := range msgs[i].Blocks {
@@ -479,10 +501,30 @@ func finalAssistant(ctx context.Context, cli *upstream.Client, todoID, fallback 
 			}
 		}
 		if b.Len() > 0 {
-			return b.String(), nil
+			result.Content = b.String()
+			return result, nil
+		}
+		if fallback != "" {
+			result.Content = fallback
+			return result, nil
 		}
 	}
-	return fallback, nil
+	return assistantResult{Content: fallback}, nil
+}
+
+func tokenUsage(meta []upstream.RunMeta) TokenUsage {
+	var usage TokenUsage
+	for _, item := range meta {
+		if item.Type != "todo:msg_meta_ai" {
+			continue
+		}
+		usage.Available = true
+		usage.InputTokens += item.Extras.InputTokens
+		usage.OutputTokens += item.Extras.OutputTokens
+		usage.CacheReadTokens += item.Extras.CacheReadTokens
+		usage.CacheWriteTokens += item.Extras.CacheWriteTokens
+	}
+	return usage
 }
 
 func conversationKey(msgs []openai.ChatMessage) string {

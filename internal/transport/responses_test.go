@@ -130,7 +130,7 @@ func TestResponsesResponseFunctionAndCustomCalls(t *testing.T) {
 		},
 	}
 	reply := &gateway.Reply{
-		Model: "resolved-model", TodoID: "todo-1", Content: "Calling tools.",
+		Model: "resolved-model", TodoID: "todo-1", Content: "Calling tools.", Usage: exactTestUsage(),
 		ToolCalls: []openai.ToolCall{
 			{ID: "call_1", Type: "function", Function: openai.FunctionCall{Name: "read_file", Arguments: `{"path":"a.txt"}`}},
 			{ID: "call_2", Type: "function", Function: openai.FunctionCall{Name: "shell", Arguments: `{"input":"pwd"}`}},
@@ -159,6 +159,12 @@ func TestResponsesResponseFunctionAndCustomCalls(t *testing.T) {
 	if response.Metadata[openai.TodoIDMetadataKey] != "todo-1" || response.Store {
 		t.Fatalf("metadata/store = %#v/%v", response.Metadata, response.Store)
 	}
+	if response.Usage == nil || response.Usage.InputTokens != 2388 || response.Usage.OutputTokens != 11 || response.Usage.TotalTokens != 2399 {
+		t.Fatalf("usage = %#v", response.Usage)
+	}
+	if response.Usage.InputTokensDetails.CachedTokens != 1536 || response.Usage.OutputTokensDetails.ReasoningTokens != 0 {
+		t.Fatalf("usage details = %#v", response.Usage)
+	}
 
 	todoID, ok := todoIDFromResponseID(response.ID)
 	if !ok || todoID != "todo-1" {
@@ -185,7 +191,7 @@ func TestResponsesStreamIncludesTypedEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := stream.finish(&gateway.Reply{
-		Model: "resolved-model", TodoID: "todo-1", Content: "hello",
+		Model: "resolved-model", TodoID: "todo-1", Content: "hello", Usage: exactTestUsage(),
 		ToolCalls: []openai.ToolCall{{
 			ID: "call_1", Type: "function",
 			Function: openai.FunctionCall{Name: "files.read_file", Arguments: `{"path":"a.txt"}`},
@@ -208,6 +214,14 @@ func TestResponsesStreamIncludesTypedEvents(t *testing.T) {
 	}
 	if strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("Responses stream contains Chat Completions terminator:\n%s", body)
+	}
+	createdResponse := responseEvent(t, body, "response.created")
+	if createdResponse.Usage != nil {
+		t.Fatalf("in-progress usage = %#v, want null", createdResponse.Usage)
+	}
+	completedResponse := responseEvent(t, body, "response.completed")
+	if completedResponse.Usage == nil || completedResponse.Usage.InputTokens != 2388 || completedResponse.Usage.InputTokensDetails.CachedTokens != 1536 || completedResponse.Usage.TotalTokens != 2399 {
+		t.Fatalf("completed usage = %#v", completedResponse.Usage)
 	}
 }
 
@@ -291,4 +305,25 @@ func TestResponsesSSECompletesCustomAndNamespaceTools(t *testing.T) {
 	if strings.Contains(body, "TOOL_CALL") {
 		t.Fatalf("tool protocol leaked into Responses stream:\n%s", body)
 	}
+}
+
+func responseEvent(t *testing.T, body, eventType string) responsesResponse {
+	t.Helper()
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event struct {
+			Type     string            `json:"type"`
+			Response responsesResponse `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			t.Fatalf("decode Responses event %q: %v", line, err)
+		}
+		if event.Type == eventType {
+			return event.Response
+		}
+	}
+	t.Fatalf("event %q not found in:\n%s", eventType, body)
+	return responsesResponse{}
 }

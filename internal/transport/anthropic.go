@@ -308,7 +308,19 @@ func buildAnthropicResponse(requestedModel string, reply *gateway.Reply) anthrop
 	}
 	return anthropicMessageResponse{
 		ID: "msg_" + fmt.Sprint(time.Now().UnixNano()), Type: "message", Role: "assistant",
-		Model: model, Content: content, StopReason: &stopReason, Usage: anthropicUsage{},
+		Model: model, Content: content, StopReason: &stopReason, Usage: anthropicTokenUsage(reply.Usage),
+	}
+}
+
+func anthropicTokenUsage(usage gateway.TokenUsage) anthropicUsage {
+	if !usage.Available {
+		return anthropicUsage{}
+	}
+	return anthropicUsage{
+		InputTokens:              usage.InputTokens,
+		CacheCreationInputTokens: usage.CacheWriteTokens,
+		CacheReadInputTokens:     usage.CacheReadTokens,
+		OutputTokens:             usage.OutputTokens,
 	}
 }
 
@@ -451,7 +463,7 @@ func (s *anthropicSSE) finish(reply *gateway.Reply) error {
 	if err := emitAnthropicEventE(s.w, s.flusher, "message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": map[string]int{"output_tokens": 0},
+		"usage": anthropicTokenUsage(reply.Usage),
 	}); err != nil {
 		return err
 	}
