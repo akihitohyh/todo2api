@@ -1,0 +1,21 @@
+# Local configuration and secrets
+config.yaml
+.env
+.env.*
+*.env
+
+# Build and test output
+/todo2api
+/dist/
+coverage.out
+*.test
+*.prof
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log

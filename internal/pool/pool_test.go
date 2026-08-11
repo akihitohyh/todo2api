@@ -1,0 +1,209 @@
+package pool
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"testing"
+	"time"
+
+	"todo2api/internal/config"
+	"todo2api/internal/upstream"
+)
+
+func TestRoundRobinAcrossAccounts(t *testing.T) {
+	first := &Account{ProjectID: "project-1"}
+	second := &Account{ProjectID: "project-2"}
+	p := &Pool{
+		accounts: []*Account{first, second},
+		strategy: "round_robin",
+	}
+
+	want := []*Account{first, second, first, second, first}
+	for i, expected := range want {
+		if got := p.Pick(); got != expected {
+			t.Fatalf("pick %d = %p, want %p", i, got, expected)
+		}
+	}
+
+	if got := p.At(1); got != second {
+		t.Fatalf("At(1) = %p, want %p", got, second)
+	}
+	if got := p.IndexOf(second); got != 1 {
+		t.Fatalf("IndexOf(second) = %d, want 1", got)
+	}
+	if got := p.At(2); got != nil {
+		t.Fatalf("At(2) = %p, want nil", got)
+	}
+	if got := p.IndexOf(&Account{}); got != -1 {
+		t.Fatalf("IndexOf(unknown) = %d, want -1", got)
+	}
+}
+
+func TestLeastBusySkipsAccountInFlight(t *testing.T) {
+	first := &Account{ProjectID: "project-1"}
+	second := &Account{ProjectID: "project-2"}
+	p := &Pool{
+		accounts: []*Account{first, second},
+		strategy: "least_busy",
+	}
+
+	if got := p.Pick(); got != first {
+		t.Fatalf("initial pick = %p, want first account %p", got, first)
+	}
+
+	first.Acquire()
+	t.Cleanup(first.Release)
+	if got := p.Pick(); got != second {
+		t.Fatalf("pick while first is busy = %p, want second account %p", got, second)
+	}
+
+	second.Acquire()
+	t.Cleanup(second.Release)
+	if got := p.Pick(); got != first {
+		t.Fatalf("pick on equal load = %p, want stable first account %p", got, first)
+	}
+}
+
+func TestEmptyPoolReturnsNil(t *testing.T) {
+	if got := (&Pool{}).Pick(); got != nil {
+		t.Fatalf("empty pool pick = %p, want nil", got)
+	}
+}
+
+func TestCommonModelsAndResolution(t *testing.T) {
+	first := []upstream.ModelInfo{
+		{ID: "openai/gpt-5.6-sol", OwnedBy: "openai"},
+		{ID: "anthropic/claude-sonnet-4.6", OwnedBy: "anthropic"},
+		{ID: "only/first"},
+	}
+	second := []upstream.ModelInfo{
+		{ID: "anthropic/claude-sonnet-4.6"},
+		{ID: "openai/gpt-5.6-sol"},
+		{ID: "only/second"},
+	}
+	models := commonModels([][]upstream.ModelInfo{first, second})
+	gotIDs := []string{models[0].ID, models[1].ID}
+	wantIDs := []string{"anthropic/claude-sonnet-4.6", "openai/gpt-5.6-sol"}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("common model IDs = %#v", gotIDs)
+	}
+
+	p := &Pool{}
+	p.setModels(models)
+	gotPublicIDs := []string{p.Models()[0].ID, p.Models()[1].ID}
+	wantPublicIDs := []string{"claude-sonnet-4.6", "gpt-5.6-sol"}
+	if !reflect.DeepEqual(gotPublicIDs, wantPublicIDs) {
+		t.Fatalf("public model IDs = %#v, want %#v", gotPublicIDs, wantPublicIDs)
+	}
+	if got := p.ResolveModel("claude-sonnet-4.6"); got != "anthropic:anthropic/claude-sonnet-4.6" {
+		t.Fatalf("resolved short model = %q", got)
+	}
+	if got := p.ResolveModel("anthropic/claude-sonnet-4.6"); got != "anthropic:anthropic/claude-sonnet-4.6" {
+		t.Fatalf("resolved model = %q", got)
+	}
+	if got := p.ResolveModel("private:model"); got != "private:model" {
+		t.Fatalf("unknown model changed to %q", got)
+	}
+	if model, ok := p.Model("openai:openai/gpt-5.6-sol"); !ok || model.ID != "openai/gpt-5.6-sol" {
+		t.Fatalf("runner model lookup = %#v, %v", model, ok)
+	}
+	if publicID, ok := p.PublicModelID("openai:openai/gpt-5.6-sol"); !ok || publicID != "gpt-5.6-sol" {
+		t.Fatalf("public model lookup = %q, %v", publicID, ok)
+	}
+	if len(p.Models()) != 2 {
+		t.Fatalf("models = %#v", p.Models())
+	}
+}
+
+func TestPublicModelIDsDisambiguateProviderCollisions(t *testing.T) {
+	p := &Pool{}
+	p.setModels([]upstream.ModelInfo{
+		{ID: "anthropic/shared-model"},
+		{ID: "google/shared-model"},
+		{ID: "openai/unique-model"},
+	})
+
+	got := []string{p.Models()[0].ID, p.Models()[1].ID, p.Models()[2].ID}
+	want := []string{"anthropic/shared-model", "google/shared-model", "unique-model"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("public model IDs = %#v, want %#v", got, want)
+	}
+	if got := p.ResolveModel("anthropic/shared-model"); got != "anthropic:anthropic/shared-model" {
+		t.Fatalf("resolved colliding model = %q", got)
+	}
+	if got := p.ResolveModel("shared-model"); got != "shared-model" {
+		t.Fatalf("ambiguous short model unexpectedly resolved to %q", got)
+	}
+}
+
+func TestCommonModelsWithoutSuccessfulCatalog(t *testing.T) {
+	if models := commonModels(nil); models != nil {
+		t.Fatalf("models = %#v", models)
+	}
+}
+
+func TestNewKeepsAccountWhenModelDiscoveryFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/models":
+			http.Error(w, "catalog unavailable", http.StatusServiceUnavailable)
+		case "/api/v1/agents":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "agent-1", "model": "template:model"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	p, err := New(&config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL + "/api/v1", PollTimeout: time.Second},
+		Pool: config.PoolConfig{Strategy: "round_robin", Keys: []config.AccountKey{{
+			APIKey: "key", ProjectID: "project-1",
+		}}},
+		Models: config.ModelsConfig{Default: "openai:openai/gpt-5.6-sol"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Pick() == nil || len(p.Models()) != 0 || len(p.Warnings()) != 1 {
+		t.Fatalf("account=%#v models=%#v warnings=%#v", p.Pick(), p.Models(), p.Warnings())
+	}
+}
+
+func TestNewHidesDynamicModelsWhenAnyAccountDiscoveryFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/models":
+			if r.Header.Get("X-API-Key") == "failing-key" {
+				http.Error(w, "catalog unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data":   []map[string]any{{"id": "openai/gpt-5.6-sol"}},
+			})
+		case "/api/v1/agents":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "agent-1", "model": "template:model"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	p, err := New(&config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL + "/api/v1", PollTimeout: time.Second},
+		Pool: config.PoolConfig{Strategy: "round_robin", Keys: []config.AccountKey{
+			{APIKey: "working-key", ProjectID: "project-1"},
+			{APIKey: "failing-key", ProjectID: "project-2"},
+		}},
+		Models: config.ModelsConfig{Default: "openai:openai/gpt-5.6-sol"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Models()) != 0 || len(p.Warnings()) != 1 {
+		t.Fatalf("models=%#v warnings=%#v", p.Models(), p.Warnings())
+	}
+}

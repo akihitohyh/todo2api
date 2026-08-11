@@ -1,0 +1,37 @@
+server:
+  addr: ":8080"
+  client_tokens:
+    - "sk-todo2api-changeme"
+
+upstream:
+  base_url: "https://api.todofor.ai/api/v1"
+  poll_timeout: 5m
+
+pool:
+  strategy: "round_robin" # round_robin or least_busy
+  keys:
+    - api_key: "${TODOFOR_API_KEY}"
+      project_id: "" # Empty selects the account's first project.
+      agent_id: "" # Empty selects the account's first AgentSettings template.
+
+models:
+  # todofor.ai's runner requires provider:author/model_id.
+  # The catalog is exposed automatically with short names. Aliases are only
+  # needed for custom names or overrides; full IDs remain accepted by clients.
+  default: "openai:openai/gpt-5.6-sol"
+  aliases:
+    gpt-5.6-sol: "openai:openai/gpt-5.6-sol"
+
+# Edge MCP tools are optional. When enabled, allowed tools are discovered once
+# and forwarded as filteredEdgeTools on each upstream request.
+edge:
+  enabled: false
+  edge_id: "" # Empty selects the first online Edge.
+  allow_tools: [] # Empty allows all discovered Edge MCP tools.
+
+# Applied only when an OpenAI request includes client-side tools. The official
+# permission matcher treats device:* as every concrete Edge/bridge device.
+tool_protocol:
+  deny_upstream_tools:
+    - "device:*"
+    - "cloud:*"

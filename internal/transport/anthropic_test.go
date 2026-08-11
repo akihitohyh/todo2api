@@ -1,0 +1,162 @@
+package transport
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"todo2api/internal/config"
+	"todo2api/internal/gateway"
+	"todo2api/internal/openai"
+)
+
+func TestAnthropicRequestConvertsToolHistory(t *testing.T) {
+	req := anthropicRequest{
+		Model:  "public-model",
+		System: json.RawMessage(`[{"type":"text","text":"system prompt"}]`),
+		Messages: []anthropicInputMessage{
+			{Role: "user", Content: json.RawMessage(`"read the file"`)},
+			{Role: "assistant", Content: json.RawMessage(`[
+				{"type":"text","text":"I'll read it."},
+				{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"a.txt"}}
+			]`)},
+			{Role: "user", Content: json.RawMessage(`[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":"file contents"}
+			]`)},
+		},
+		Tools: []anthropicTool{{
+			Name: "read_file", Description: "Read a file",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`),
+		}},
+	}
+
+	chat, err := req.chatRequest("todo-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat.Model != "public-model" || chat.Metadata[openai.TodoIDMetadataKey] != "todo-1" {
+		t.Fatalf("chat request = %#v", chat)
+	}
+	if len(chat.Messages) != 4 {
+		t.Fatalf("messages = %#v", chat.Messages)
+	}
+	if chat.Messages[0].Role != "system" || chat.Messages[0].Content != "system prompt" {
+		t.Fatalf("system message = %#v", chat.Messages[0])
+	}
+	assistant := chat.Messages[2]
+	if assistant.Content != "I'll read it." || len(assistant.ToolCalls) != 1 {
+		t.Fatalf("assistant message = %#v", assistant)
+	}
+	if assistant.ToolCalls[0].ID != "toolu_1" || assistant.ToolCalls[0].Function.Arguments != `{"path":"a.txt"}` {
+		t.Fatalf("tool call = %#v", assistant.ToolCalls[0])
+	}
+	result := chat.Messages[3]
+	if result.Role != "tool" || result.Name != "read_file" || result.Content != "file contents" {
+		t.Fatalf("tool result = %#v", result)
+	}
+	if len(chat.Tools) != 1 || chat.Tools[0].Function.Name != "read_file" {
+		t.Fatalf("tools = %#v", chat.Tools)
+	}
+}
+
+func TestAnthropicResponseAndStreamToolUse(t *testing.T) {
+	reply := &gateway.Reply{
+		Model: "resolved-model", TodoID: "todo-1", Content: "Using a tool.",
+		ToolCalls: []openai.ToolCall{{
+			ID: "toolu_1", Type: "function",
+			Function: openai.FunctionCall{Name: "read_file", Arguments: `{"path":"a.txt"}`},
+		}},
+	}
+	response := buildAnthropicResponse("public-model", reply)
+	if response.Model != "public-model" || response.StopReason == nil || *response.StopReason != "tool_use" {
+		t.Fatalf("response = %#v", response)
+	}
+	if len(response.Content) != 2 || response.Content[1].Name != "read_file" {
+		t.Fatalf("content = %#v", response.Content)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(response.Content[1].Input, &input); err != nil || input["path"] != "a.txt" {
+		t.Fatalf("tool input = %#v, err = %v", input, err)
+	}
+
+	recorder := httptest.NewRecorder()
+	stream := &anthropicSSE{w: recorder, flusher: recorder, requestedModel: "public-model"}
+	if err := stream.start(reply.Model, reply.TodoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.textDelta(reply.Content); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.finish(reply); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"event: message_start",
+		"event: content_block_start",
+		`"type":"input_json_delta"`,
+		`"stop_reason":"tool_use"`,
+		"event: message_stop",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream does not contain %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestAnthropicSSEWritesTextDeltasBeforeStop(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	stream := &anthropicSSE{
+		w: recorder, flusher: recorder, requestedModel: "public-model",
+	}
+	if err := stream.start("resolved-model", "todo-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.textDelta("hello"); err != nil {
+		t.Fatal(err)
+	}
+	partial := recorder.Body.String()
+	if !strings.Contains(partial, `"text":"hello"`) || strings.Contains(partial, "event: message_stop") {
+		t.Fatalf("partial stream = %s", partial)
+	}
+	if err := stream.textDelta(" world"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.finish(&gateway.Reply{Model: "resolved-model", TodoID: "todo-1"}); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	first := strings.Index(body, `"text":"hello"`)
+	second := strings.Index(body, `"text":" world"`)
+	stop := strings.Index(body, "event: message_stop")
+	if first < 0 || second <= first || stop <= second {
+		t.Fatalf("event order is wrong:\n%s", body)
+	}
+	if recorder.Header().Get(todoIDHeader) != "todo-1" || recorder.Header().Get("X-Accel-Buffering") != "no" {
+		t.Fatalf("SSE headers = %#v", recorder.Header())
+	}
+}
+
+func TestAnthropicMisspellingAndAPIKeyAuth(t *testing.T) {
+	s := &Server{cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}}}
+	handler := s.Handler()
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messeges/count_tokens", strings.NewReader(`{
+		"model":"public-model","messages":[{"role":"user","content":"hello"}]
+	}`))
+	req.Header.Set("X-API-Key", "client-key")
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]int
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["input_tokens"] <= 0 || recorder.Header().Get("X-Todo2API-Token-Estimate") != "true" {
+		t.Fatalf("response = %#v, headers = %#v", response, recorder.Header())
+	}
+}
