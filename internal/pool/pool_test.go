@@ -69,6 +69,33 @@ func TestLeastBusySkipsAccountInFlight(t *testing.T) {
 	}
 }
 
+func TestLeastBusyRotatesEqualAccountsAndSkipsCooldown(t *testing.T) {
+	first := &Account{ProjectID: "project-1"}
+	second := &Account{ProjectID: "project-2"}
+	p := &Pool{
+		accounts: []*Account{first, second},
+		strategy: "least_busy",
+	}
+
+	if got := p.Pick(); got != first {
+		t.Fatalf("first equal-load pick = %p, want first account %p", got, first)
+	}
+	if got := p.Pick(); got != second {
+		t.Fatalf("second equal-load pick = %p, want second account %p", got, second)
+	}
+
+	first.CoolDown(time.Hour)
+	for i := 0; i < 3; i++ {
+		if got := p.Pick(); got != second {
+			t.Fatalf("pick %d during cooldown = %p, want second account %p", i, got, second)
+		}
+	}
+	second.CoolDown(time.Hour)
+	if got := p.Pick(); got != nil {
+		t.Fatalf("all-cooled pick = %p, want nil", got)
+	}
+}
+
 func TestEmptyPoolReturnsNil(t *testing.T) {
 	if got := (&Pool{}).Pick(); got != nil {
 		t.Fatalf("empty pool pick = %p, want nil", got)

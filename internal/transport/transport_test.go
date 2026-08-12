@@ -154,6 +154,20 @@ func TestUnavailableChatUsageIsOmitted(t *testing.T) {
 	}
 }
 
+func TestGatewayUnavailableMapsToRetryable503(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeAnthropicGatewayErr(recorder, fmt.Errorf("create failed: %w", gateway.ErrAccountsUnavailable))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	if retryAfter := recorder.Header().Get("Retry-After"); retryAfter != "60" {
+		t.Fatalf("Retry-After = %q, want 60", retryAfter)
+	}
+	if !strings.Contains(recorder.Body.String(), `"type":"api_error"`) {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
 func TestModelsIncludesDefaultAndIsSorted(t *testing.T) {
 	s := &Server{cfg: &config.Config{Models: config.ModelsConfig{
 		Default: "model-default",

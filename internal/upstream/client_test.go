@@ -3,11 +3,37 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func TestHTTPErrorPreservesUpstreamDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{
+			"message": "Insufficient balance. Please add funds or subscribe.",
+			"code":    "INTERNAL_SERVER_ERROR",
+		})
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, "key").CreateTodo(
+		context.Background(), "project-1", "hello", AgentSettings{},
+	)
+	var upstreamErr *HTTPError
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("error = %T %v, want *HTTPError", err, err)
+	}
+	if upstreamErr.StatusCode != http.StatusInternalServerError ||
+		upstreamErr.Code != "INTERNAL_SERVER_ERROR" ||
+		!strings.Contains(upstreamErr.Message, "Insufficient balance") {
+		t.Fatalf("HTTP error = %#v", upstreamErr)
+	}
+}
 
 func TestCreateAndAddMessageWireFormat(t *testing.T) {
 	var createBody, addBody map[string]any

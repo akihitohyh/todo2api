@@ -1,6 +1,9 @@
 package session
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Store maps a conversation key to the upstream todo it lives in, plus the
 // account index that owns it (so continuations reuse the same key).
@@ -12,8 +15,9 @@ type Store struct {
 }
 
 type Entry struct {
-	TodoID  string
-	Account int
+	TodoID    string
+	Account   int
+	ExpiresAt time.Time
 }
 
 func New() *Store {
@@ -66,5 +70,42 @@ func (s *Store) Put(key string, e Entry) {
 	}
 	if e.TodoID != "" {
 		s.byTodoID[e.TodoID] = e
+	}
+}
+
+// StartCleanup periodically removes expired session state.
+func (s *Store) StartCleanup(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			s.cleanup()
+		}
+	}()
+}
+
+func (s *Store) cleanup() {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, entry := range s.byHistory {
+		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
+			delete(s.byHistory, key)
+		}
+	}
+
+	validTodoIDs := make(map[string]struct{})
+	for todoID, entry := range s.byTodoID {
+		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
+			delete(s.byTodoID, todoID)
+		} else {
+			validTodoIDs[todoID] = struct{}{}
+		}
+	}
+
+	for todoID := range s.toolNames {
+		if _, exists := validTodoIDs[todoID]; !exists {
+			delete(s.toolNames, todoID)
+		}
 	}
 }

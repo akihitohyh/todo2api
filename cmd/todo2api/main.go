@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"time"
 
 	"todo2api/internal/config"
 	"todo2api/internal/gateway"
@@ -39,11 +40,22 @@ func main() {
 	})
 
 	sess := session.New()
+	sess.StartCleanup(5 * time.Minute)
 	gw := gateway.New(cfg, p, sess)
 	srv := transport.New(cfg, gw)
 
 	log.Printf("todo2api listening on %s", cfg.Server.Addr)
-	if err := http.ListenAndServe(cfg.Server.Addr, srv.Handler()); err != nil {
+
+	server := &http.Server{
+		Addr:           cfg.Server.Addr,
+		Handler:        srv.Handler(),
+		ReadTimeout:    15 * time.Second,
+		WriteTimeout:   6 * time.Minute,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

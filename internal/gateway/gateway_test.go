@@ -175,11 +175,16 @@ type mockUpstream struct {
 	streamFragments   []string
 	streamDelay       time.Duration
 	beforeReady       chan struct{}
+	createFailures    map[string]bool
+	createAttempts    map[string]int
 }
 
 func newMockUpstream(t *testing.T) *mockUpstream {
 	t.Helper()
-	m := &mockUpstream{t: t, sockets: map[string]*websocket.Conn{}}
+	m := &mockUpstream{
+		t: t, sockets: map[string]*websocket.Conn{},
+		createFailures: map[string]bool{}, createAttempts: map[string]int{},
+	}
 	upgrader := websocket.Upgrader{
 		CheckOrigin:  func(*http.Request) bool { return true },
 		Subprotocols: []string{"upstream-key"},
@@ -242,6 +247,8 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 	mux.HandleFunc("/api/v1/projects/project-1/todos", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		apiKey := r.Header.Get("X-API-Key")
+		m.createAttempts[apiKey]++
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
@@ -251,6 +258,14 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 		} else {
 			m.createCount++
 			m.createBody = body
+		}
+		if m.createFailures[apiKey] {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{
+				"message": "Insufficient balance. Please add funds or subscribe.",
+				"code":    "INTERNAL_SERVER_ERROR",
+			})
+			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"id": "todo-1", "projectId": "project-1", "status": "RUNNING",
@@ -388,6 +403,98 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 		m.server.Close()
 	})
 	return m
+}
+
+func TestNewConversationFailsOverFromInsufficientBalance(t *testing.T) {
+	mock := newMockUpstream(t)
+	mock.mu.Lock()
+	mock.createFailures["bad-key"] = true
+	mock.mu.Unlock()
+
+	cfg := &config.Config{
+		Upstream: config.UpstreamConfig{
+			BaseURL: mock.server.URL + "/api/v1", PollTimeout: 3 * time.Second,
+		},
+		Pool: config.PoolConfig{
+			Strategy: "least_busy",
+			Keys: []config.AccountKey{
+				{APIKey: "bad-key", ProjectID: "project-1"},
+				{APIKey: "good-key", ProjectID: "project-1"},
+			},
+		},
+		Models: config.ModelsConfig{
+			Default: "openai:vendor/upstream-model",
+			Aliases: map[string]string{"public-model": "openai:vendor/upstream-model"},
+		},
+	}
+	p, err := pool.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := New(cfg, p, session.New())
+
+	reply, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model: "public-model", Messages: []openai.ChatMessage{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.TodoID != "todo-1" {
+		t.Fatalf("reply = %#v", reply)
+	}
+
+	mock.mu.Lock()
+	badAttempts := mock.createAttempts["bad-key"]
+	goodAttempts := mock.createAttempts["good-key"]
+	mock.mu.Unlock()
+	if badAttempts != 1 || goodAttempts != 1 {
+		t.Fatalf("create attempts: bad=%d good=%d", badAttempts, goodAttempts)
+	}
+	if len(cfg.Pool.Keys) != 1 || cfg.Pool.Keys[0].APIKey != "good-key" {
+		t.Fatalf("runtime config keys = %#v", cfg.Pool.Keys)
+	}
+	if p.At(0) != nil {
+		t.Fatal("removed account remained addressable")
+	}
+	if got := p.Pick(); got != p.At(1) {
+		t.Fatalf("removed account remained selectable: got=%p want=%p", got, p.At(1))
+	}
+}
+
+func TestAccountFailurePolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		action accountFailureAction
+		min    time.Duration
+	}{
+		{
+			name: "balance in 500 body",
+			err: &upstream.HTTPError{
+				StatusCode: http.StatusInternalServerError,
+				Message:    "Insufficient balance. Please add funds or subscribe.",
+			},
+			action: accountFailureRemove,
+		},
+		{
+			name: "rate limit", err: &upstream.HTTPError{StatusCode: http.StatusTooManyRequests},
+			action: accountFailureCooldown, min: time.Minute,
+		},
+		{
+			name: "generic upstream failure",
+			err:  &upstream.HTTPError{StatusCode: http.StatusInternalServerError, Message: "internal error"},
+		},
+		{name: "network error", err: errors.New("connection reset")},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			action, duration := accountFailurePolicy(test.err)
+			if action != test.action || duration < test.min {
+				t.Fatalf("action = %d, cooldown = %s", action, duration)
+			}
+		})
+	}
 }
 
 func TestStreamEmitsTextBeforeReady(t *testing.T) {
@@ -543,8 +650,18 @@ func TestConversationKeyIncludesToolCalls(t *testing.T) {
 			Function: openai.FunctionCall{Name: "write", Arguments: `{}`},
 		}},
 	})
-	if strings.EqualFold(conversationKey(withRead), conversationKey(withWrite)) {
+	if strings.EqualFold(conversationKey("", withRead), conversationKey("", withWrite)) {
 		t.Fatal("conversation key ignored tool calls")
+	}
+}
+
+func TestConversationKeyIncludesSystemPrompt(t *testing.T) {
+	messages := []openai.ChatMessage{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "hi"},
+	}
+	if strings.EqualFold(conversationKey("be concise", messages), conversationKey("be detailed", messages)) {
+		t.Fatal("conversation key ignored the system prompt")
 	}
 }
 

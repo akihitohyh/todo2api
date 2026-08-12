@@ -99,7 +99,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	reply, err := s.gw.Complete(ctx, chatReq)
 	if err != nil {
-		writeAnthropicErr(w, http.StatusBadGateway, "api_error", err.Error())
+		writeAnthropicGatewayErr(w, err)
 		return
 	}
 	w.Header().Set(todoIDHeader, reply.TodoID)
@@ -145,9 +145,7 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 		if err != nil {
 			return openai.ChatRequest{}, fmt.Errorf("invalid system content: %w", err)
 		}
-		if system != "" {
-			chat.Messages = append(chat.Messages, openai.ChatMessage{Role: "system", Content: system})
-		}
+		appendAnthropicSystem(&chat.System, system)
 	}
 
 	callNames := make(map[string]string)
@@ -217,6 +215,12 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 				}
 			}
 			flushText()
+		case "system":
+			system, err := anthropicText(message.Content)
+			if err != nil {
+				return openai.ChatRequest{}, fmt.Errorf("invalid system message content: %w", err)
+			}
+			appendAnthropicSystem(&chat.System, system)
 		default:
 			return openai.ChatRequest{}, fmt.Errorf("unsupported message role %q", message.Role)
 		}
@@ -238,6 +242,16 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 		})
 	}
 	return chat, nil
+}
+
+func appendAnthropicSystem(system *string, content string) {
+	if content == "" {
+		return
+	}
+	if *system != "" {
+		*system += "\n\n"
+	}
+	*system += content
 }
 
 func decodeAnthropicContent(raw json.RawMessage) ([]anthropicContentBlock, error) {
@@ -335,7 +349,7 @@ func (s *Server) streamAnthropic(
 	reply, err := s.gw.Stream(ctx, chatReq, stream.onGatewayEvent)
 	if err != nil {
 		if !stream.started {
-			writeAnthropicErr(w, http.StatusBadGateway, "api_error", err.Error())
+			writeAnthropicGatewayErr(w, err)
 			return
 		}
 		_ = stream.emitError(err)

@@ -170,7 +170,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	reply, err := s.gw.Complete(ctx, chatReq)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeGatewayErr(w, err)
 		return
 	}
 	w.Header().Set(todoIDHeader, reply.TodoID)
@@ -623,7 +623,7 @@ func (s *Server) streamResponses(
 	reply, err := s.gw.Stream(ctx, chatReq, stream.onGatewayEvent)
 	if err != nil {
 		if !stream.started {
-			writeErr(w, http.StatusBadGateway, err.Error())
+			writeGatewayErr(w, err)
 			return
 		}
 		_ = stream.emitError(err)

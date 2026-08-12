@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -80,6 +81,66 @@ models:
 	}
 	if !reflect.DeepEqual(cfg.Pool.Keys, want) {
 		t.Fatalf("keys = %#v, want %#v", cfg.Pool.Keys, want)
+	}
+}
+
+func TestRemovePoolKeyPersistsAcrossReload(t *testing.T) {
+	t.Setenv("REMOVE_ME", "remove-key")
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "accounts.keys")
+	if err := os.WriteFile(keyFile, []byte("remove-key\nfile-keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	data := []byte(`
+pool:
+  key_files:
+    - accounts.keys
+  keys:
+    - api_key: "${REMOVE_ME}"
+      project_id: removed-project
+    - api_key: inline-keep
+      project_id: kept-project
+models:
+  default: openai:vendor/upstream-model
+`)
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.RemovePoolKey("remove-key"); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Pool.Keys) != 2 {
+		t.Fatalf("in-memory keys after removal = %#v", cfg.Pool.Keys)
+	}
+
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFileData, err := os.ReadFile(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(configData, []byte("${REMOVE_ME}")) || bytes.Contains(keyFileData, []byte("remove-key")) {
+		t.Fatalf("key remained in sources:\nconfig=%s\nkey file=%s", configData, keyFileData)
+	}
+
+	reloaded, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []AccountKey{
+		{APIKey: "inline-keep", ProjectID: "kept-project"},
+		{APIKey: "file-keep"},
+	}
+	if !reflect.DeepEqual(reloaded.Pool.Keys, want) {
+		t.Fatalf("reloaded keys = %#v, want %#v", reloaded.Pool.Keys, want)
 	}
 }
 

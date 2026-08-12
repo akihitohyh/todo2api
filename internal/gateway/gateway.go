@@ -5,9 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"todo2api/internal/config"
 	"todo2api/internal/openai"
@@ -21,6 +25,8 @@ type Gateway struct {
 	pool *pool.Pool
 	sess *session.Store
 }
+
+var ErrAccountsUnavailable = errors.New("all upstream accounts are unavailable")
 
 func New(cfg *config.Config, p *pool.Pool, s *session.Store) *Gateway {
 	return &Gateway{cfg: cfg, pool: p, sess: s}
@@ -147,48 +153,48 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 		if acc == nil {
 			return nil, fmt.Errorf("session references unavailable account %d", entry.Account)
 		}
-	} else {
-		acc = g.pool.Pick()
-		if acc == nil {
-			return nil, fmt.Errorf("account pool is empty")
-		}
 	}
 	if resuming {
 		req.Messages = enrichToolResultNames(req.Messages, entry.TodoID, g.sess)
 	}
 
-	acc.Acquire()
-	defer acc.Release()
-	agent := g.agentSettings(acc.Agent, runnerModel, req.Tools)
-	filteredTools := acc.EdgeTools
-	if len(req.Tools) > 0 {
-		filteredTools = nil
-	}
-
 	runCtx, cancel := context.WithTimeout(ctx, g.cfg.Upstream.PollTimeout)
 	defer cancel()
-	sub, err := acc.Client.PrepareSubscription(runCtx)
-	if err != nil {
-		return nil, err
-	}
-	defer sub.Close()
 
+	var sub *upstream.Subscription
 	todoID := entry.TodoID
-	if !resuming {
-		content := openai.FlattenTurn(req.Messages)
-		todo, err := acc.Client.CreateTodo(runCtx, acc.ProjectID, content, agent, filteredTools)
+	if resuming {
+		acc.Acquire()
+		defer acc.Release()
+		var err error
+		sub, err = acc.Client.PrepareSubscription(runCtx)
 		if err != nil {
+			if handleErr := g.handleAccountFailure(acc, err); handleErr != nil {
+				return nil, handleErr
+			}
 			return nil, err
 		}
-		todoID = todo.ID
-	} else {
+		defer sub.Close()
+
+		agent, filteredTools := g.accountRequestSettings(acc, runnerModel, req)
 		content := followUpBody(req.Messages)
 		if content == "" {
 			return nil, fmt.Errorf("resumed request has no new user or tool-result messages")
 		}
 		if _, err := acc.Client.AddMessage(runCtx, acc.ProjectID, todoID, content, agent, filteredTools); err != nil {
+			if handleErr := g.handleAccountFailure(acc, err); handleErr != nil {
+				return nil, handleErr
+			}
 			return nil, err
 		}
+	} else {
+		var err error
+		acc, sub, todoID, err = g.startNewConversation(runCtx, req, runnerModel)
+		if err != nil {
+			return nil, err
+		}
+		defer acc.Release()
+		defer sub.Close()
 	}
 	if todoID == "" {
 		return nil, fmt.Errorf("upstream returned an empty todo id")
@@ -209,6 +215,9 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 	}
 	result, err := g.waitAssistant(runCtx, sub, acc.Client, todoID, emitText)
 	if err != nil {
+		if handleErr := g.handleAccountFailure(acc, err); handleErr != nil {
+			return nil, handleErr
+		}
 		return nil, err
 	}
 	content := result.Content
@@ -224,8 +233,8 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 		return nil, fmt.Errorf("selected account is not in the pool")
 	}
 	g.sess.Put(
-		conversationKeyWith(req.Messages, assistant),
-		session.Entry{TodoID: todoID, Account: accountIndex},
+		conversationKeyWith(req.System, req.Messages, assistant),
+		session.Entry{TodoID: todoID, Account: accountIndex, ExpiresAt: time.Now().Add(30 * time.Minute)},
 	)
 	if len(calls) > 0 {
 		names := make(map[string]string, len(calls))
@@ -241,6 +250,130 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 		}, nil
 	}
 	return &Reply{Content: content, Model: publicModel, TodoID: todoID, Usage: result.Usage}, nil
+}
+
+func (g *Gateway) startNewConversation(
+	ctx context.Context,
+	req openai.ChatRequest,
+	runnerModel string,
+) (*pool.Account, *upstream.Subscription, string, error) {
+	excluded := make(map[*pool.Account]struct{})
+	content := openai.FlattenTurn(req.Messages)
+	attempts := g.pool.Len()
+	var lastErr error
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		acc := g.pool.PickExcept(excluded)
+		if acc == nil {
+			break
+		}
+		acc.Acquire()
+
+		sub, err := acc.Client.PrepareSubscription(ctx)
+		if err == nil {
+			agent, filteredTools := g.accountRequestSettings(acc, runnerModel, req)
+			var todo *upstream.Todo
+			todo, err = acc.Client.CreateTodo(ctx, acc.ProjectID, content, agent, filteredTools)
+			if err == nil {
+				return acc, sub, todo.ID, nil
+			}
+		}
+
+		if sub != nil {
+			sub.Close()
+		}
+		acc.Release()
+		action, cooldown := accountFailurePolicy(err)
+		if action == accountFailureNone {
+			return nil, nil, "", err
+		}
+
+		if handleErr := g.applyAccountFailure(acc, action, cooldown, err); handleErr != nil {
+			return nil, nil, "", handleErr
+		}
+		excluded[acc] = struct{}{}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return nil, nil, "", fmt.Errorf("%w: %v", ErrAccountsUnavailable, lastErr)
+	}
+	return nil, nil, "", ErrAccountsUnavailable
+}
+
+func (g *Gateway) handleAccountFailure(acc *pool.Account, cause error) error {
+	action, cooldown := accountFailurePolicy(cause)
+	if action == accountFailureNone {
+		return nil
+	}
+	return g.applyAccountFailure(acc, action, cooldown, cause)
+}
+
+func (g *Gateway) applyAccountFailure(
+	acc *pool.Account,
+	action accountFailureAction,
+	cooldown time.Duration,
+	cause error,
+) error {
+	index := g.pool.IndexOf(acc) + 1
+	if action == accountFailureRemove {
+		if err := g.pool.Remove(acc); err != nil {
+			return fmt.Errorf("remove exhausted upstream account: %w", err)
+		}
+		log.Printf("upstream account %d permanently removed: %v", index, cause)
+		return nil
+	}
+	acc.CoolDown(cooldown)
+	log.Printf("upstream account %d disabled for %s: %v", index, cooldown, cause)
+	return nil
+}
+
+func (g *Gateway) accountRequestSettings(
+	acc *pool.Account,
+	runnerModel string,
+	req openai.ChatRequest,
+) (upstream.AgentSettings, upstream.FilteredEdgeTools) {
+	agent := g.agentSettings(acc.Agent, runnerModel, req.System, req.Tools)
+	filteredTools := acc.EdgeTools
+	if len(req.Tools) > 0 {
+		filteredTools = nil
+	}
+	return agent, filteredTools
+}
+
+type accountFailureAction uint8
+
+const (
+	accountFailureNone accountFailureAction = iota
+	accountFailureCooldown
+	accountFailureRemove
+)
+
+func accountFailurePolicy(err error) (accountFailureAction, time.Duration) {
+	var upstreamErr *upstream.HTTPError
+	if !errors.As(err, &upstreamErr) {
+		return accountFailureNone, 0
+	}
+
+	switch upstreamErr.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return accountFailureCooldown, time.Hour
+	case http.StatusPaymentRequired:
+		return accountFailureRemove, 0
+	case http.StatusTooManyRequests:
+		return accountFailureCooldown, 2 * time.Minute
+	}
+
+	detail := strings.ToLower(upstreamErr.Message + " " + upstreamErr.Body)
+	for _, marker := range []string{
+		"insufficient balance", "add funds", "insufficient credit",
+		"subscription required",
+	} {
+		if strings.Contains(detail, marker) {
+			return accountFailureRemove, 0
+		}
+	}
+	return accountFailureNone, 0
 }
 
 func (g *Gateway) resolveModel(requested string) string {
@@ -299,17 +432,30 @@ func enrichToolResultNames(msgs []openai.ChatMessage, todoID string, store *sess
 	return copyMessages
 }
 
-func (g *Gateway) agentSettings(template upstream.AgentSettings, model string, tools []openai.Tool) upstream.AgentSettings {
+func (g *Gateway) agentSettings(template upstream.AgentSettings, model string, systemPrompt string, tools []openai.Tool) upstream.AgentSettings {
 	agent := template
 	agent.Model = model
-	if len(tools) == 0 {
-		return agent
+
+	// Merge user-provided system prompt with tool instructions
+	if systemPrompt != "" && len(tools) > 0 {
+		// Both system and tools: combine them
+		agent.SystemMessage = systemPrompt + "\n\n" + openai.BuildToolSystemPrompt(tools)
+		agent.SystemMessageMode = "raw"
+	} else if systemPrompt != "" {
+		// Only system prompt
+		agent.SystemMessage = systemPrompt
+		agent.SystemMessageMode = "raw"
+	} else if len(tools) > 0 {
+		// Only tools
+		agent.SystemMessage = openai.BuildToolSystemPrompt(tools)
+		agent.SystemMessageMode = "raw"
 	}
-	agent.SystemMessage = openai.BuildToolSystemPrompt(tools)
-	agent.SystemMessageMode = "raw"
-	agent.Permissions = &upstream.ToolPermissions{
-		Allow: []string{},
-		Deny:  append([]string(nil), g.cfg.ToolProtocol.DenyUpstreamTools...),
+
+	if len(tools) > 0 {
+		agent.Permissions = &upstream.ToolPermissions{
+			Allow: []string{},
+			Deny:  append([]string(nil), g.cfg.ToolProtocol.DenyUpstreamTools...),
+		}
 	}
 	return agent
 }
@@ -320,7 +466,7 @@ func (g *Gateway) sessionEntry(req openai.ChatRequest) (session.Entry, bool) {
 			return entry, true
 		}
 	}
-	if key := conversationKey(req.Messages); key != "" {
+	if key := conversationKey(req.System, req.Messages); key != "" {
 		return g.sess.Get(key)
 	}
 	return session.Entry{}, false
@@ -527,23 +673,26 @@ func tokenUsage(meta []upstream.RunMeta) TokenUsage {
 	return usage
 }
 
-func conversationKey(msgs []openai.ChatMessage) string {
+func conversationKey(system string, msgs []openai.ChatMessage) string {
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role == "assistant" {
-			return hashMessages(msgs[:i+1])
+			return hashConversation(system, msgs[:i+1])
 		}
 	}
 	return ""
 }
 
-func conversationKeyWith(msgs []openai.ChatMessage, assistant openai.ChatMessage) string {
+func conversationKeyWith(system string, msgs []openai.ChatMessage, assistant openai.ChatMessage) string {
 	extended := append([]openai.ChatMessage{}, msgs...)
 	extended = append(extended, assistant)
-	return hashMessages(extended)
+	return hashConversation(system, extended)
 }
 
-func hashMessages(msgs []openai.ChatMessage) string {
-	data, _ := json.Marshal(msgs)
+func hashConversation(system string, msgs []openai.ChatMessage) string {
+	data, _ := json.Marshal(struct {
+		System   string               `json:"system,omitempty"`
+		Messages []openai.ChatMessage `json:"messages"`
+	}{System: system, Messages: msgs})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }

@@ -51,7 +51,9 @@ func (c *Client) PrepareSubscription(ctx context.Context) (*Subscription, error)
 	conn, resp, err := dialer.DialContext(ctx, wsEndpoint, nil)
 	if err != nil {
 		if resp != nil {
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
+			return nil, newHTTPError(http.MethodGet, wsEndpoint, resp.StatusCode, data)
 		}
 		return nil, fmt.Errorf("frontend ws dial %s: %w", wsEndpoint, err)
 	}
@@ -143,7 +145,7 @@ func (c *Client) subscribeTodo(ctx context.Context, todoID, tabID string) error 
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("subscribe todo %s: %d %s", todoID, resp.StatusCode, string(data))
+		return newHTTPError(http.MethodPost, path, resp.StatusCode, data)
 	}
 	_, err = io.Copy(io.Discard, resp.Body)
 	return err

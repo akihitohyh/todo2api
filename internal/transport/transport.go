@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -131,7 +132,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	reply, err := s.gw.Complete(ctx, req)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeGatewayErr(w, err)
 		return
 	}
 	w.Header().Set(todoIDHeader, reply.TodoID)
@@ -187,7 +188,7 @@ func (s *Server) streamChat(w http.ResponseWriter, flusher http.Flusher, ctx con
 	reply, err := s.gw.Stream(ctx, req, stream.onGatewayEvent)
 	if err != nil {
 		if !stream.started {
-			writeErr(w, http.StatusBadGateway, err.Error())
+			writeGatewayErr(w, err)
 			return
 		}
 		_ = stream.emitError(err)
@@ -328,4 +329,20 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, openai.APIError{Error: openai.ErrorBody{Message: msg, Type: "error"}})
+}
+
+func gatewayErrorStatus(w http.ResponseWriter, err error) int {
+	if errors.Is(err, gateway.ErrAccountsUnavailable) {
+		w.Header().Set("Retry-After", "60")
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+func writeGatewayErr(w http.ResponseWriter, err error) {
+	writeErr(w, gatewayErrorStatus(w, err), err.Error())
+}
+
+func writeAnthropicGatewayErr(w http.ResponseWriter, err error) {
+	writeAnthropicErr(w, gatewayErrorStatus(w, err), "api_error", err.Error())
 }

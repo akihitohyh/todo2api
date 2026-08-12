@@ -9,6 +9,7 @@ type ChatRequest struct {
 	StreamOptions *StreamOptions    `json:"stream_options,omitempty"`
 	Tools         []Tool            `json:"tools,omitempty"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
+	System        string            `json:"system,omitempty"` // Anthropic-style system parameter
 }
 
 type StreamOptions struct {

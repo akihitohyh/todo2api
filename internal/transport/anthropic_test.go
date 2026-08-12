@@ -39,24 +39,90 @@ func TestAnthropicRequestConvertsToolHistory(t *testing.T) {
 	if chat.Model != "public-model" || chat.Metadata[openai.TodoIDMetadataKey] != "todo-1" {
 		t.Fatalf("chat request = %#v", chat)
 	}
-	if len(chat.Messages) != 4 {
+	if chat.System != "system prompt" {
+		t.Fatalf("system = %#v", chat.System)
+	}
+	if len(chat.Messages) != 3 {
 		t.Fatalf("messages = %#v", chat.Messages)
 	}
-	if chat.Messages[0].Role != "system" || chat.Messages[0].Content != "system prompt" {
-		t.Fatalf("system message = %#v", chat.Messages[0])
+	if chat.Messages[0].Role != "user" || chat.Messages[0].Content != "read the file" {
+		t.Fatalf("user message = %#v", chat.Messages[0])
 	}
-	assistant := chat.Messages[2]
+	assistant := chat.Messages[1]
 	if assistant.Content != "I'll read it." || len(assistant.ToolCalls) != 1 {
 		t.Fatalf("assistant message = %#v", assistant)
 	}
 	if assistant.ToolCalls[0].ID != "toolu_1" || assistant.ToolCalls[0].Function.Arguments != `{"path":"a.txt"}` {
 		t.Fatalf("tool call = %#v", assistant.ToolCalls[0])
 	}
-	result := chat.Messages[3]
+	result := chat.Messages[2]
 	if result.Role != "tool" || result.Name != "read_file" || result.Content != "file contents" {
 		t.Fatalf("tool result = %#v", result)
 	}
 	if len(chat.Tools) != 1 || chat.Tools[0].Function.Name != "read_file" {
+		t.Fatalf("tools = %#v", chat.Tools)
+	}
+}
+
+func TestAnthropicRequestExtractsClaudeCodeSystemMessages(t *testing.T) {
+	var req anthropicRequest
+	if err := json.Unmarshal([]byte(`{
+		"model":"public-model",
+		"max_tokens":4096,
+		"system":[
+			{"type":"text","text":"top-level system","cache_control":{"type":"ephemeral"}}
+		],
+		"messages":[
+			{"role":"system","content":[{"type":"text","text":"mid-conversation system","cache_control":{"type":"ephemeral"}}]},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"private reasoning","signature":"signature"},
+				{"type":"text","text":"Using a tool."},
+				{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"file contents"}],"cache_control":{"type":"ephemeral"}},
+				{"type":"text","text":"continue"}
+			]}
+		],
+		"tools":[{
+			"name":"Read",
+			"description":"Read a file",
+			"input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}},
+			"cache_control":{"type":"ephemeral"}
+		}],
+		"tool_choice":{"type":"auto"},
+		"thinking":{"type":"enabled","budget_tokens":1024},
+		"metadata":{"user_id":"claude-code"},
+		"stream":true
+	}`), &req); err != nil {
+		t.Fatal(err)
+	}
+
+	chat, err := req.chatRequest("todo-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat.System != "top-level system\n\nmid-conversation system" {
+		t.Fatalf("system = %q", chat.System)
+	}
+	if len(chat.Messages) != 3 {
+		t.Fatalf("messages = %#v", chat.Messages)
+	}
+	for _, message := range chat.Messages {
+		if message.Role == "system" {
+			t.Fatalf("system leaked into messages: %#v", chat.Messages)
+		}
+	}
+	if chat.Messages[0].Role != "assistant" || len(chat.Messages[0].ToolCalls) != 1 {
+		t.Fatalf("assistant history = %#v", chat.Messages[0])
+	}
+	if chat.Messages[1].Role != "tool" || chat.Messages[1].Content != "file contents" {
+		t.Fatalf("tool result = %#v", chat.Messages[1])
+	}
+	if chat.Messages[2].Role != "user" || chat.Messages[2].Content != "continue" {
+		t.Fatalf("user continuation = %#v", chat.Messages[2])
+	}
+	if len(chat.Tools) != 1 || chat.Tools[0].Function.Name != "Read" {
 		t.Fatalf("tools = %#v", chat.Tools)
 	}
 }

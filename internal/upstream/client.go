@@ -12,6 +12,36 @@ import (
 	"time"
 )
 
+// HTTPError preserves an error response from the todofor.ai API so callers
+// can distinguish account failures from malformed requests.
+type HTTPError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Message    string
+	Code       string
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("upstream %s %s: %d %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+type errorResponse struct {
+	Message string `json:"message"`
+	Code    string `json:"code"`
+}
+
+func newHTTPError(method, path string, statusCode int, data []byte) *HTTPError {
+	body := strings.TrimSpace(string(data))
+	var response errorResponse
+	_ = json.Unmarshal(data, &response)
+	return &HTTPError{
+		Method: method, Path: path, StatusCode: statusCode,
+		Message: response.Message, Code: response.Code, Body: body,
+	}
+}
+
 // Block is a message content block (text / tool / bash ...).
 type Block struct {
 	Type    string `json:"type"`
@@ -76,10 +106,24 @@ type modelListResp struct {
 }
 
 func New(baseURL, apiKey string) *Client {
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		MaxConnsPerHost:       50,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
+	}
+
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		http: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: transport,
+		},
 	}
 }
 
@@ -259,7 +303,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		return err
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("upstream %s %s: %d %s", method, path, resp.StatusCode, string(data))
+		return newHTTPError(method, path, resp.StatusCode, data)
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)

@@ -13,8 +13,10 @@ allowing the upstream agent to execute local device tools itself.
 - OpenAI-compatible non-streaming responses and incremental SSE responses
 - OpenAI `/v1/responses` typed items, function/custom/namespace tools, and typed SSE
 - Anthropic `/v1/messages` content blocks, tool use/results, and SSE
+- Claude Code-compatible top-level `system`, cache-control, thinking, and tool history handling
 - Dynamically discovered `/v1/models` catalog and optional gateway bearer-token authentication
 - Round-robin and least-busy account selection
+- Automatic account failover, cooldowns, and persistent removal of exhausted keys
 - Correct todofor.ai frontend WebSocket subscription flow
 - Client-side tool calls with `finish_reason: "tool_calls"`
 - In-memory continuation by canonical history hash
@@ -116,6 +118,15 @@ batches while retaining file order for round-robin selection. Temporary
 initialization failures are retried; accounts that still cannot load a project
 or Agent template are skipped. Startup fails only when none are usable.
 
+For new conversations, the gateway retries another available account after a
+recognized account failure. HTTP `429` temporarily cools an account down, while
+HTTP `402` or an explicit insufficient-balance/subscription-required response
+permanently disables the account and removes its key from both inline
+`pool.keys` entries and configured `pool.key_files`. Credential files are
+rewritten with `fsync` and an atomic rename, so removed keys do not return after
+a configuration reload or service restart. If no account can accept a new
+conversation, the gateway returns HTTP `503` with `Retry-After: 60`.
+
 Basic request:
 
 ```bash
@@ -164,6 +175,13 @@ curl http://localhost:8080/v1/messages \
 
 Set `"stream":true` and use `curl --no-buffer` to receive Anthropic
 `content_block_delta` events before `message_stop`.
+
+Claude Code's top-level `system` field is kept separate from the Anthropic
+`messages` array and forwarded as the upstream agent system prompt. For
+compatibility with clients that include historical `role: "system"` entries,
+the gateway merges those entries into the same system prompt instead of
+rejecting them or forwarding them as ordinary conversation messages. Common
+`cache_control`, `thinking`, `tool_use`, and `tool_result` blocks are accepted.
 
 `/v1/messeges` is also registered as a compatibility alias for clients with
 that misspelling. `/v1/messages/count_tokens` is available as an estimate
@@ -228,9 +246,9 @@ Or use the response/request header:
 X-Todo2API-Todo-ID: <todo-id>
 ```
 
-The fallback uses an in-memory reverse index and therefore does not survive a
-gateway restart. Persisting and signing conversation references is a future
-hardening step.
+The fallback uses an in-memory reverse index with a 30-minute expiry and
+therefore does not survive a gateway restart. Persisting and signing
+conversation references is a future hardening step.
 
 ## Test
 
@@ -242,11 +260,13 @@ go build ./cmd/todo2api
 Tests include an HTTP/WebSocket mock of the official subscription protocol,
 pre-terminal delta timing, split tool-tag filtering, cancellation, tool-call
 continuation, Responses Item/SSE conversion, Anthropic content/SSE conversion,
-exact `runMeta` usage mapping, and account-pool selection. Live account
-verification still requires a valid todofor.ai API key; use
+Claude Code system-message conversion, exact `runMeta` usage mapping,
+account-pool selection, exhausted-account failover, and persistent credential
+removal across configuration reloads. Live account verification still requires
+a valid todofor.ai API key; use
 `examples/tool_call_curl.sh` as the account-level probe.
 
 ## Remaining work
 
-1. Persist session references with TTLs and authenticated resume tokens.
+1. Persist session references across restarts and add authenticated resume tokens.
 2. Add broader compatibility for multimodal OpenAI message content.

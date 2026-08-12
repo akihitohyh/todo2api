@@ -15,17 +15,36 @@ import (
 
 // Account is one pooled todofor.ai API key + its upstream client.
 type Account struct {
-	Client    *upstream.Client
-	ProjectID string
-	Agent     upstream.AgentSettings
-	EdgeTools upstream.FilteredEdgeTools // discovered once, forwarded per request
-	inflight  int64
-	key       config.AccountKey
-	ready     atomic.Bool
+	Client        *upstream.Client
+	ProjectID     string
+	Agent         upstream.AgentSettings
+	EdgeTools     upstream.FilteredEdgeTools // discovered once, forwarded per request
+	inflight      int64
+	cooldownUntil atomic.Int64
+	disabled      atomic.Bool
+	removeMu      sync.Mutex
+	key           config.AccountKey
+	ready         atomic.Bool
 }
 
 func (a *Account) Acquire() { atomic.AddInt64(&a.inflight, 1) }
 func (a *Account) Release() { atomic.AddInt64(&a.inflight, -1) }
+
+// CoolDown temporarily removes an unhealthy account from new-conversation
+// selection. Existing sessions can still address it directly through At.
+func (a *Account) CoolDown(duration time.Duration) {
+	until := time.Now().Add(duration).UnixNano()
+	for {
+		current := a.cooldownUntil.Load()
+		if current >= until || a.cooldownUntil.CompareAndSwap(current, until) {
+			return
+		}
+	}
+}
+
+func (a *Account) available(now int64) bool {
+	return !a.disabled.Load() && a.cooldownUntil.Load() <= now
+}
 
 type Pool struct {
 	accounts      []*Account
@@ -377,7 +396,11 @@ func (p *Pool) At(i int) *Account {
 	if i < 0 || i >= len(p.accounts) {
 		return nil
 	}
-	return p.accounts[i]
+	account := p.accounts[i]
+	if account.disabled.Load() {
+		return nil
+	}
+	return account
 }
 
 func (p *Pool) IndexOf(a *Account) int {
@@ -391,31 +414,83 @@ func (p *Pool) IndexOf(a *Account) int {
 	return -1
 }
 
+// Remove deletes an account from its configured credential source and
+// permanently excludes it from new-conversation selection. The stable slot is
+// retained because active sessions persist account indexes.
+func (p *Pool) Remove(a *Account) error {
+	p.readyMu.RLock()
+	found := false
+	for _, account := range p.accounts {
+		if account == a {
+			found = true
+			break
+		}
+	}
+	p.readyMu.RUnlock()
+	if !found {
+		return fmt.Errorf("account is not in the pool")
+	}
+
+	a.removeMu.Lock()
+	defer a.removeMu.Unlock()
+	if a.disabled.Load() {
+		return nil
+	}
+	a.disabled.Store(true)
+	if p.cfg == nil {
+		a.disabled.Store(false)
+		return fmt.Errorf("pool configuration is unavailable")
+	}
+	if err := p.cfg.RemovePoolKey(a.key.APIKey); err != nil {
+		a.disabled.Store(false)
+		return fmt.Errorf("persist account removal: %w", err)
+	}
+	return nil
+}
+
 // Pick selects an account by the configured strategy.
 func (p *Pool) Pick() *Account {
+	return p.PickExcept(nil)
+}
+
+// PickExcept selects an available account that is not in excluded. Rotating
+// the scan start also distributes least-busy traffic across idle accounts.
+func (p *Pool) PickExcept(excluded map[*Account]struct{}) *Account {
 	p.readyMu.RLock()
 	defer p.readyMu.RUnlock()
 	if len(p.accounts) == 0 {
 		return nil
 	}
+	start := int((atomic.AddUint64(&p.rr, 1) - 1) % uint64(len(p.accounts)))
 	switch p.strategy {
 	case "least_busy":
-		return p.leastBusy()
+		return p.leastBusy(start, excluded)
 	default:
-		return p.roundRobin()
+		return p.roundRobin(start, excluded)
 	}
 }
 
-func (p *Pool) roundRobin() *Account {
-	n := atomic.AddUint64(&p.rr, 1)
-	return p.accounts[(n-1)%uint64(len(p.accounts))]
+func (p *Pool) roundRobin(start int, excluded map[*Account]struct{}) *Account {
+	now := time.Now().UnixNano()
+	for offset := range p.accounts {
+		account := p.accounts[(start+offset)%len(p.accounts)]
+		if _, skip := excluded[account]; !skip && account.available(now) {
+			return account
+		}
+	}
+	return nil
 }
 
-func (p *Pool) leastBusy() *Account {
-	best := p.accounts[0]
-	for _, a := range p.accounts[1:] {
-		if atomic.LoadInt64(&a.inflight) < atomic.LoadInt64(&best.inflight) {
-			best = a
+func (p *Pool) leastBusy(start int, excluded map[*Account]struct{}) *Account {
+	now := time.Now().UnixNano()
+	var best *Account
+	for offset := range p.accounts {
+		account := p.accounts[(start+offset)%len(p.accounts)]
+		if _, skip := excluded[account]; skip || !account.available(now) {
+			continue
+		}
+		if best == nil || atomic.LoadInt64(&account.inflight) < atomic.LoadInt64(&best.inflight) {
+			best = account
 		}
 	}
 	return best
