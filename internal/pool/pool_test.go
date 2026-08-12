@@ -1,10 +1,13 @@
 package pool
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,5 +208,126 @@ func TestNewHidesDynamicModelsWhenAnyAccountDiscoveryFails(t *testing.T) {
 	}
 	if len(p.Models()) != 0 || len(p.Warnings()) != 1 {
 		t.Fatalf("models=%#v warnings=%#v", p.Models(), p.Warnings())
+	}
+}
+
+func TestNewSkipsUnusableAccountsAndPreservesOrder(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-Key")
+		if key == "bad-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/v1/models":
+			json.NewEncoder(w).Encode(map[string]any{
+				"object": "list", "data": []map[string]any{{"id": "openai/gpt-5.6-sol"}},
+			})
+		case "/api/v1/projects":
+			// Delay the first configured key so concurrent completion order differs
+			// from configuration order.
+			if key == "first-key" {
+				time.Sleep(30 * time.Millisecond)
+			}
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "project-" + key}})
+		case "/api/v1/agents":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "agent-" + key}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	p, err := New(&config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL + "/api/v1", PollTimeout: time.Second},
+		Pool: config.PoolConfig{Strategy: "round_robin", Keys: []config.AccountKey{
+			{APIKey: "first-key"},
+			{APIKey: "bad-key"},
+			{APIKey: "third-key"},
+		}},
+		Models: config.ModelsConfig{Default: "openai:openai/gpt-5.6-sol"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Len() != 2 || len(p.Warnings()) != 1 {
+		t.Fatalf("accounts=%d warnings=%#v", p.Len(), p.Warnings())
+	}
+	if first, second := p.Pick(), p.Pick(); first.ProjectID != "project-first-key" || second.ProjectID != "project-third-key" {
+		t.Fatalf("account order = %q, %q", first.ProjectID, second.ProjectID)
+	}
+	if len(p.Models()) != 1 || p.Models()[0].ID != "gpt-5.6-sol" {
+		t.Fatalf("models = %#v", p.Models())
+	}
+}
+
+func TestNewFailsWhenEveryAccountIsUnusable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	_, err := New(&config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL, PollTimeout: time.Second},
+		Pool: config.PoolConfig{Keys: []config.AccountKey{
+			{APIKey: "bad-key-1"}, {APIKey: "bad-key-2"},
+		}},
+		Models: config.ModelsConfig{Default: "openai:openai/gpt-5.6-sol"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no usable accounts out of 2 configured") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestWarmAddsAccountsWithoutChangingExistingIndexes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-Key")
+		switch r.URL.Path {
+		case "/api/v1/models":
+			json.NewEncoder(w).Encode(map[string]any{
+				"object": "list", "data": []map[string]any{{"id": "openai/gpt-5.6-sol"}},
+			})
+		case "/api/v1/projects":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "project-" + key}})
+		case "/api/v1/agents":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "agent-" + key}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	keys := make([]config.AccountKey, bootstrapAccounts+3)
+	for i := range keys {
+		keys[i].APIKey = fmt.Sprintf("key-%d", i)
+	}
+	p, err := New(&config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL + "/api/v1", PollTimeout: time.Second},
+		Pool:     config.PoolConfig{Strategy: "round_robin", Keys: keys},
+		Models:   config.ModelsConfig{Default: "openai:openai/gpt-5.6-sol"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := p.At(0)
+	if p.Len() != bootstrapAccounts || p.Configured() != len(keys) {
+		t.Fatalf("ready=%d configured=%d", p.Len(), p.Configured())
+	}
+
+	var callbacks int
+	p.Warm(context.Background(), func(ready, skipped, processed int) {
+		callbacks++
+		if skipped != 0 || processed > len(keys) || ready <= bootstrapAccounts {
+			t.Fatalf("callback = ready %d, skipped %d, processed %d", ready, skipped, processed)
+		}
+		if ready != processed {
+			t.Fatalf("all test accounts should be ready: ready %d, processed %d", ready, processed)
+		}
+	})
+	if callbacks == 0 || p.Len() != len(keys) {
+		t.Fatalf("callbacks=%d ready=%d", callbacks, p.Len())
+	}
+	if p.At(0) != first || p.IndexOf(first) != 0 {
+		t.Fatal("background warmup changed an existing account index")
 	}
 }

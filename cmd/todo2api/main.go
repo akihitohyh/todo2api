@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
@@ -28,7 +29,14 @@ func main() {
 	for _, warning := range p.Warnings() {
 		log.Printf("pool warning: %v", warning)
 	}
+	log.Printf("initialized %d of %d upstream accounts", p.Len(), p.Configured())
 	log.Printf("discovered %d common upstream models", len(p.Models()))
+	configured := p.Configured()
+	go p.Warm(context.Background(), func(ready, skipped, processed int) {
+		if processed == configured || processed%50 < 2 {
+			log.Printf("account pool warmup: %d ready, %d skipped, %d configured", ready, skipped, configured)
+		}
+	})
 
 	sess := session.New()
 	gw := gateway.New(cfg, p, sess)

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -44,6 +45,59 @@ models:
 	}
 	if !reflect.DeepEqual(cfg.ToolProtocol.DenyUpstreamTools, []string{"device:*", "cloud:*"}) {
 		t.Fatalf("deny defaults = %#v", cfg.ToolProtocol.DenyUpstreamTools)
+	}
+}
+
+func TestLoadMergesAndDeduplicatesKeyFiles(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "accounts.keys")
+	if err := os.WriteFile(keyFile, []byte("# imported accounts\nfile-key-1\ninline-key\n\nfile-key-2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	data := []byte(`
+pool:
+  key_files:
+    - accounts.keys
+  keys:
+    - api_key: inline-key
+      project_id: project-1
+models:
+  default: openai:vendor/upstream-model
+`)
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []AccountKey{
+		{APIKey: "inline-key", ProjectID: "project-1"},
+		{APIKey: "file-key-1"},
+		{APIKey: "file-key-2"},
+	}
+	if !reflect.DeepEqual(cfg.Pool.Keys, want) {
+		t.Fatalf("keys = %#v, want %#v", cfg.Pool.Keys, want)
+	}
+}
+
+func TestLoadRejectsMissingKeyFile(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	data := []byte(`
+pool:
+  key_files: [missing.keys]
+models:
+  default: openai:vendor/upstream-model
+`)
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "open pool key file") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

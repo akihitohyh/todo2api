@@ -1,9 +1,11 @@
 package config
 
 import (
+	"bufio"
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,6 +40,7 @@ type UpstreamConfig struct {
 type PoolConfig struct {
 	Strategy string       `yaml:"strategy"`
 	Keys     []AccountKey `yaml:"keys"`
+	KeyFiles []string     `yaml:"key_files"`
 }
 
 type AccountKey struct {
@@ -98,11 +101,67 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(data))), &cfg); err != nil {
 		return nil, fmt.Errorf("decode YAML: %w", err)
 	}
+	if err := cfg.loadKeyFiles(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
 	cfg.setDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func (c *Config) loadKeyFiles(configDir string) error {
+	seen := make(map[string]struct{}, len(c.Pool.Keys))
+	keys := make([]AccountKey, 0, len(c.Pool.Keys))
+	appendKey := func(key AccountKey) {
+		key.APIKey = strings.TrimSpace(key.APIKey)
+		if key.APIKey == "" {
+			return
+		}
+		if _, exists := seen[key.APIKey]; exists {
+			return
+		}
+		seen[key.APIKey] = struct{}{}
+		keys = append(keys, key)
+	}
+	for _, key := range c.Pool.Keys {
+		appendKey(key)
+	}
+
+	for _, configuredPath := range c.Pool.KeyFiles {
+		path := os.ExpandEnv(strings.TrimSpace(configuredPath))
+		if path == "" {
+			return fmt.Errorf("pool.key_files must not contain an empty path")
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(configDir, path)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("open pool key file %s: %w", path, err)
+		}
+		scanner := bufio.NewScanner(file)
+		line := 0
+		for scanner.Scan() {
+			line++
+			value := strings.TrimSpace(scanner.Text())
+			if value == "" || strings.HasPrefix(value, "#") {
+				continue
+			}
+			appendKey(AccountKey{APIKey: value})
+		}
+		scanErr := scanner.Err()
+		closeErr := file.Close()
+		if scanErr != nil {
+			return fmt.Errorf("read pool key file %s at line %d: %w", path, line, scanErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close pool key file %s: %w", path, closeErr)
+		}
+	}
+	c.Pool.Keys = keys
+	return nil
 }
 
 func (c *Config) setDefaults() {

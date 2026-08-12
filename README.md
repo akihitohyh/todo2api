@@ -98,6 +98,24 @@ aliases under `models.aliases` override discovered IDs on collision. A
 transient catalog failure is logged as a startup warning and falls back to the
 configured aliases and short default name instead of preventing startup.
 
+Large account pools can be loaded from files without expanding the YAML or
+systemd environment. Each file contains one API key per line; blank lines,
+comments, and duplicates are ignored:
+
+```yaml
+pool:
+  strategy: round_robin
+  key_files:
+    - /etc/todo2api/accounts.keys
+  keys: []
+```
+
+The first configured accounts are initialized synchronously so the gateway can
+start in seconds. Remaining accounts are initialized in small background
+batches while retaining file order for round-robin selection. Temporary
+initialization failures are retried; accounts that still cannot load a project
+or Agent template are skipped. Startup fails only when none are usable.
+
 Basic request:
 
 ```bash

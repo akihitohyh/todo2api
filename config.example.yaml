@@ -9,6 +9,9 @@ upstream:
 
 pool:
   strategy: "round_robin" # round_robin or least_busy
+  # Optional files contain one API key per line. Relative paths resolve from
+  # this config file. Blank lines, comments, and duplicate keys are ignored.
+  key_files: []
   keys:
     - api_key: "${TODOFOR_API_KEY}"
       project_id: "" # Empty selects the account's first project.
