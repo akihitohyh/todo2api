@@ -162,6 +162,51 @@ models:
 	}
 }
 
+func TestLoadPoolKeysRereadsKeyFiles(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "accounts.keys")
+	if err := os.WriteFile(keyFile, []byte("file-key-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	data := []byte(`
+pool:
+  key_files:
+    - accounts.keys
+  keys:
+    - api_key: inline-key
+models:
+  default: openai:vendor/upstream-model
+`)
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, []byte("file-key-2\nfile-key-3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := cfg.LoadPoolKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []AccountKey{
+		{APIKey: "inline-key"},
+		{APIKey: "file-key-2"},
+		{APIKey: "file-key-3"},
+	}
+	if !reflect.DeepEqual(keys, want) {
+		t.Fatalf("keys = %#v, want %#v", keys, want)
+	}
+	// Original loaded config stays unchanged until the pool reloads.
+	if !reflect.DeepEqual(cfg.Pool.Keys, []AccountKey{{APIKey: "inline-key"}, {APIKey: "file-key-1"}}) {
+		t.Fatalf("loaded keys mutated: %#v", cfg.Pool.Keys)
+	}
+}
+
 func TestRejectsUnqualifiedUpstreamModels(t *testing.T) {
 	for name, models := range map[string]ModelsConfig{
 		"default": {Default: "anthropic/claude-sonnet-4.6"},

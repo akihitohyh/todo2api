@@ -21,7 +21,9 @@ type Account struct {
 	EdgeTools     upstream.FilteredEdgeTools // discovered once, forwarded per request
 	inflight      int64
 	cooldownUntil atomic.Int64
-	disabled      atomic.Bool
+	disabled      atomic.Bool // permanent removal (e.g. exhausted balance)
+	removed       atomic.Bool // soft-delete from key-file hot reload
+	initing       atomic.Bool
 	removeMu      sync.Mutex
 	key           config.AccountKey
 	ready         atomic.Bool
@@ -43,7 +45,26 @@ func (a *Account) CoolDown(duration time.Duration) {
 }
 
 func (a *Account) available(now int64) bool {
-	return !a.disabled.Load() && a.cooldownUntil.Load() <= now
+	return !a.disabled.Load() && !a.removed.Load() && a.cooldownUntil.Load() <= now
+}
+
+// Removed reports whether the account was soft-deleted by a key-file reload.
+// Soft-removed accounts stay addressable by index for in-flight sessions but
+// are excluded from Pick for new traffic.
+func (a *Account) Removed() bool { return a.removed.Load() }
+
+// APIKey returns the upstream API key for this account.
+func (a *Account) APIKey() string { return a.key.APIKey }
+
+func (a *Account) claimInit() bool {
+	if a.ready.Load() || a.removed.Load() || a.disabled.Load() {
+		return false
+	}
+	return a.initing.CompareAndSwap(false, true)
+}
+
+func (a *Account) releaseInit() {
+	a.initing.Store(false)
 }
 
 type Pool struct {
@@ -51,6 +72,7 @@ type Pool struct {
 	configured    []*Account
 	strategy      string
 	rr            uint64
+	mu            sync.Mutex // serializes Warm progress and ReloadKeys planning
 	readyMu       sync.RWMutex
 	models        []upstream.ModelInfo
 	modelByID     map[string]upstream.ModelInfo
@@ -59,6 +81,16 @@ type Pool struct {
 	warnings      []error
 	cfg           *config.Config
 	warmStart     int
+}
+
+// ReloadStats summarizes a key-set hot reload.
+type ReloadStats struct {
+	Added      int
+	Removed    int
+	Restored   int
+	Failed     int
+	Ready      int
+	Configured int
 }
 
 const (
@@ -260,40 +292,177 @@ func (p *Pool) Warnings() []error {
 	return append([]error(nil), p.warnings...)
 }
 
-// Len returns the number of usable accounts in the pool.
+// Len returns the number of ready accounts that are not permanently disabled
+// or soft-removed. Cooldown accounts still count.
 func (p *Pool) Len() int {
 	p.readyMu.RLock()
 	defer p.readyMu.RUnlock()
-	return len(p.accounts)
+	n := 0
+	for _, account := range p.accounts {
+		if account != nil && !account.disabled.Load() && !account.removed.Load() {
+			n++
+		}
+	}
+	return n
 }
 
-// Configured returns the total number of unique configured accounts.
-func (p *Pool) Configured() int { return len(p.configured) }
+// Configured returns the total number of unique non-removed, non-disabled
+// configured accounts.
+func (p *Pool) Configured() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, account := range p.configured {
+		if !account.disabled.Load() && !account.removed.Load() {
+			n++
+		}
+	}
+	return n
+}
 
 // Warm initializes the remaining configured accounts in bounded background
 // batches. onBatch receives cumulative ready/skipped/processed counts.
 func (p *Pool) Warm(ctx context.Context, onBatch func(ready, skipped, configured int)) {
 	skipped := 0
-	for start := p.warmStart; start < len(p.configured); start += maxWarmWorkers {
+	for {
 		if ctx.Err() != nil {
 			return
 		}
+		p.mu.Lock()
+		start := p.warmStart
+		if start >= len(p.configured) {
+			p.mu.Unlock()
+			return
+		}
 		end := min(start+maxWarmWorkers, len(p.configured))
-		results := p.initializeBatch(ctx, start, end, false, maxWarmAttempts)
-		for _, result := range results {
+		batch := append([]*Account(nil), p.configured[start:end]...)
+		p.warmStart = end
+		processed := end
+		p.mu.Unlock()
+
+		for _, account := range batch {
+			if !account.claimInit() {
+				continue
+			}
+			result := initializeAccountWithRetry(ctx, p.cfg, account, false, maxWarmAttempts)
 			if result.err != nil {
+				account.releaseInit()
 				skipped++
 				continue
 			}
 			p.addReady(result.account)
 		}
 		if onBatch != nil {
-			onBatch(p.Len(), skipped, end)
+			onBatch(p.Len(), skipped, processed)
 		}
 	}
 }
 
+// ReloadKeys reconciles the pool with the desired key set. Existing account
+// indices are preserved: removed keys are soft-deleted (excluded from Pick),
+// and reappearing keys are restored in place when possible.
+func (p *Pool) ReloadKeys(ctx context.Context, keys []config.AccountKey) (ReloadStats, error) {
+	desired, desiredOrder := normalizeDesiredKeys(keys)
+
+	p.mu.Lock()
+	byKey := make(map[string]*Account, len(p.configured))
+	activeKeys := make(map[string]struct{}, len(p.configured))
+	for _, account := range p.configured {
+		byKey[account.key.APIKey] = account
+		if !account.removed.Load() && !account.disabled.Load() {
+			activeKeys[account.key.APIKey] = struct{}{}
+		}
+	}
+
+	var stats ReloadStats
+	var needInit []*Account
+
+	for key := range activeKeys {
+		if _, ok := desired[key]; ok {
+			continue
+		}
+		account := byKey[key]
+		account.removed.Store(true)
+		stats.Removed++
+	}
+
+	for _, key := range desiredOrder {
+		if account, ok := byKey[key.APIKey]; ok {
+			wasOut := account.removed.Load() || account.disabled.Load()
+			if wasOut {
+				account.removed.Store(false)
+				account.disabled.Store(false)
+				account.key = key
+				stats.Restored++
+				if !account.ready.Load() {
+					needInit = append(needInit, account)
+				}
+			}
+			continue
+		}
+		account := &Account{
+			Client: upstream.New(p.cfg.Upstream.BaseURL, key.APIKey),
+			key:    key,
+		}
+		p.configured = append(p.configured, account)
+		byKey[key.APIKey] = account
+		stats.Added++
+		needInit = append(needInit, account)
+	}
+	stats.Configured = 0
+	for _, account := range p.configured {
+		if !account.disabled.Load() && !account.removed.Load() {
+			stats.Configured++
+		}
+	}
+	p.mu.Unlock()
+
+	for i, account := range needInit {
+		if err := ctx.Err(); err != nil {
+			for _, remaining := range needInit[i:] {
+				if !remaining.ready.Load() && !remaining.removed.Load() && !remaining.disabled.Load() {
+					stats.Failed++
+				}
+			}
+			stats.Ready = p.Len()
+			return stats, err
+		}
+		if !account.claimInit() {
+			continue
+		}
+		result := initializeAccountWithRetry(ctx, p.cfg, account, false, maxWarmAttempts)
+		if result.err != nil {
+			account.releaseInit()
+			stats.Failed++
+			continue
+		}
+		p.addReady(result.account)
+	}
+	stats.Ready = p.Len()
+	return stats, nil
+}
+
+func normalizeDesiredKeys(keys []config.AccountKey) (map[string]config.AccountKey, []config.AccountKey) {
+	desired := make(map[string]config.AccountKey, len(keys))
+	order := make([]config.AccountKey, 0, len(keys))
+	for _, key := range keys {
+		key.APIKey = strings.TrimSpace(key.APIKey)
+		if key.APIKey == "" {
+			continue
+		}
+		if _, exists := desired[key.APIKey]; exists {
+			continue
+		}
+		desired[key.APIKey] = key
+		order = append(order, key)
+	}
+	return desired, order
+}
+
 func (p *Pool) addReady(account *Account) {
+	if account.removed.Load() || account.disabled.Load() {
+		return
+	}
 	if !account.ready.CompareAndSwap(false, true) {
 		return
 	}
