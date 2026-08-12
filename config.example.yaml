@@ -11,6 +11,7 @@ pool:
   strategy: "round_robin" # round_robin or least_busy
   # Optional files contain one API key per line. Relative paths resolve from
   # this config file. Blank lines, comments, and duplicate keys are ignored.
+  # Files are watched at runtime: add/remove lines to hot-update the pool.
   key_files: []
   keys:
     - api_key: "${TODOFOR_API_KEY}"

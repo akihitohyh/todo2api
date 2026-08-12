@@ -19,3 +19,8 @@ coverage.out
 
 # Logs
 *.log
+
+api_keys.txt
+*.exe
+build/
+build.bat

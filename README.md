@@ -127,6 +127,19 @@ rewritten with `fsync` and an atomic rename, so removed keys do not return after
 a configuration reload or service restart. If no account can accept a new
 conversation, the gateway returns HTTP `503` with `Retry-After: 60`.
 
+When `pool.key_files` is set, those files are polled every 2s (500ms debounce).
+On content change the gateway re-reads the config source plus key files, merges
+them, and hot-updates the account pool:
+
+- **added** keys are initialized in the background and enter rotation
+- **removed** keys are soft-deleted: excluded from new `Pick` traffic, but keep
+  their account index so in-flight multi-turn sessions can finish
+- **reappearing** keys are restored in place (same index) when possible
+
+Atomic replace of a key file is safe: a brief missing/unreadable file skips that
+tick and keeps the last good set. Restart is not required for key file edits.
+Hot reload also respects permanent key removals written by account failover.
+
 Basic request:
 
 ```bash

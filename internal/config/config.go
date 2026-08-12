@@ -121,6 +121,67 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// LoadPoolKeys re-reads the config source and key_files from disk and returns
+// the merged key set. Used for hot-reload so permanent RemovePoolKey rewrites
+// are respected. Does not mutate c.Pool.Keys; updates c.keyFilePaths under lock.
+func (c *Config) LoadPoolKeys() ([]AccountKey, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tmp := &Config{sourcePath: c.sourcePath}
+	if c.sourcePath != "" {
+		data, err := os.ReadFile(c.sourcePath)
+		if err != nil {
+			return nil, fmt.Errorf("read config for key reload: %w", err)
+		}
+		if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(data))), tmp); err != nil {
+			return nil, fmt.Errorf("decode YAML for key reload: %w", err)
+		}
+	} else {
+		tmp.Pool.Keys = append([]AccountKey(nil), c.Pool.Keys...)
+		tmp.Pool.KeyFiles = append([]string(nil), c.Pool.KeyFiles...)
+	}
+
+	configDir := ""
+	if c.sourcePath != "" {
+		configDir = filepath.Dir(c.sourcePath)
+	}
+	if err := tmp.loadKeyFiles(configDir); err != nil {
+		return nil, err
+	}
+	c.keyFilePaths = append([]string(nil), tmp.keyFilePaths...)
+	c.Pool.KeyFiles = append([]string(nil), tmp.Pool.KeyFiles...)
+	return append([]AccountKey(nil), tmp.Pool.Keys...), nil
+}
+
+// ResolvedKeyFilePaths returns absolute paths for configured pool.key_files.
+func (c *Config) ResolvedKeyFilePaths() ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.keyFilePaths) > 0 {
+		return append([]string(nil), c.keyFilePaths...), nil
+	}
+	configDir := ""
+	if c.sourcePath != "" {
+		configDir = filepath.Dir(c.sourcePath)
+	}
+	paths := make([]string, 0, len(c.Pool.KeyFiles))
+	for _, configuredPath := range c.Pool.KeyFiles {
+		path := os.ExpandEnv(strings.TrimSpace(configuredPath))
+		if path == "" {
+			return nil, fmt.Errorf("pool.key_files must not contain an empty path")
+		}
+		if !filepath.IsAbs(path) {
+			if configDir == "" {
+				return nil, fmt.Errorf("pool.key_files relative path %q requires a loaded config path", path)
+			}
+			path = filepath.Join(configDir, path)
+		}
+		paths = append(paths, filepath.Clean(path))
+	}
+	return paths, nil
+}
+
 func (c *Config) loadKeyFiles(configDir string) error {
 	seen := make(map[string]struct{}, len(c.Pool.Keys))
 	keys := make([]AccountKey, 0, len(c.Pool.Keys))
@@ -139,6 +200,7 @@ func (c *Config) loadKeyFiles(configDir string) error {
 		appendKey(key)
 	}
 
+	c.keyFilePaths = c.keyFilePaths[:0]
 	for _, configuredPath := range c.Pool.KeyFiles {
 		path := os.ExpandEnv(strings.TrimSpace(configuredPath))
 		if path == "" {
@@ -345,14 +407,15 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) (err error) {
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
 
+	// Best-effort directory sync. On some platforms (notably Windows) this can
+	// fail with access denied even after a successful rename; the payload was
+	// already fsynced before rename.
 	directory, openErr := os.Open(dir)
 	if openErr != nil {
-		return fmt.Errorf("open directory for %s: %w", path, openErr)
+		return nil
 	}
-	defer directory.Close()
-	if err = directory.Sync(); err != nil {
-		return fmt.Errorf("sync directory for %s: %w", path, err)
-	}
+	_ = directory.Sync()
+	_ = directory.Close()
 	return nil
 }
 

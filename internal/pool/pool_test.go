@@ -358,3 +358,129 @@ func TestWarmAddsAccountsWithoutChangingExistingIndexes(t *testing.T) {
 		t.Fatal("background warmup changed an existing account index")
 	}
 }
+
+func TestReloadKeysAddsRemovesAndRestores(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-Key")
+		switch r.URL.Path {
+		case "/api/v1/models":
+			json.NewEncoder(w).Encode(map[string]any{
+				"object": "list", "data": []map[string]any{{"id": "openai/gpt-5.6-sol"}},
+			})
+		case "/api/v1/projects":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "project-" + key}})
+		case "/api/v1/agents":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "agent-" + key}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL + "/api/v1", PollTimeout: time.Second},
+		Pool: config.PoolConfig{Strategy: "round_robin", Keys: []config.AccountKey{
+			{APIKey: "key-a"},
+			{APIKey: "key-b"},
+		}},
+		Models: config.ModelsConfig{Default: "openai:openai/gpt-5.6-sol"},
+	}
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := p.At(0)
+	second := p.At(1)
+	if first == nil || second == nil {
+		t.Fatalf("expected two ready accounts, got %d", p.Len())
+	}
+	firstIndex := p.IndexOf(first)
+	secondIndex := p.IndexOf(second)
+
+	stats, err := p.ReloadKeys(context.Background(), []config.AccountKey{
+		{APIKey: "key-a"},
+		{APIKey: "key-c"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Added != 1 || stats.Removed != 1 || stats.Restored != 0 || stats.Failed != 0 {
+		t.Fatalf("stats = %+v", stats)
+	}
+	if p.Len() != 2 || p.Configured() != 2 {
+		t.Fatalf("ready=%d configured=%d", p.Len(), p.Configured())
+	}
+	if p.At(firstIndex) != first || first.Removed() {
+		t.Fatal("kept account lost index or was removed")
+	}
+	if p.At(secondIndex) != second || !second.Removed() {
+		t.Fatal("removed account should remain addressable but marked removed")
+	}
+	if got := p.Pick(); got == second {
+		t.Fatal("Pick selected a removed account")
+	}
+
+	seen := map[string]bool{}
+	for i := 0; i < 10; i++ {
+		acc := p.Pick()
+		if acc == nil || acc.Removed() {
+			t.Fatalf("pick returned unusable account: %#v", acc)
+		}
+		seen[acc.APIKey()] = true
+	}
+	if !seen["key-a"] || !seen["key-c"] || seen["key-b"] {
+		t.Fatalf("pick set = %#v", seen)
+	}
+
+	stats, err = p.ReloadKeys(context.Background(), []config.AccountKey{
+		{APIKey: "key-a"},
+		{APIKey: "key-b"},
+		{APIKey: "key-c"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Restored != 1 || stats.Added != 0 || stats.Removed != 0 {
+		t.Fatalf("restore stats = %+v", stats)
+	}
+	if second.Removed() || p.IndexOf(second) != secondIndex {
+		t.Fatal("restored account should reuse the original index")
+	}
+	if p.Len() != 3 {
+		t.Fatalf("ready after restore = %d", p.Len())
+	}
+}
+
+func TestReloadKeysPreservesInlineOnlySet(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/models":
+			json.NewEncoder(w).Encode(map[string]any{
+				"object": "list", "data": []map[string]any{{"id": "openai/gpt-5.6-sol"}},
+			})
+		case "/api/v1/projects":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "project-1"}})
+		case "/api/v1/agents":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "agent-1"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	p, err := New(&config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL + "/api/v1", PollTimeout: time.Second},
+		Pool:     config.PoolConfig{Keys: []config.AccountKey{{APIKey: "only-key"}, {APIKey: "file-key"}}},
+		Models:   config.ModelsConfig{Default: "openai:openai/gpt-5.6-sol"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := p.ReloadKeys(context.Background(), []config.AccountKey{{APIKey: "only-key"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Removed != 1 || p.Len() != 1 || p.Configured() != 1 {
+		t.Fatalf("stats=%+v ready=%d configured=%d", stats, p.Len(), p.Configured())
+	}
+}

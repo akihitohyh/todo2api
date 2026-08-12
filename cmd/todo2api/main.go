@@ -32,12 +32,14 @@ func main() {
 	}
 	log.Printf("initialized %d of %d upstream accounts", p.Len(), p.Configured())
 	log.Printf("discovered %d common upstream models", len(p.Models()))
-	configured := p.Configured()
-	go p.Warm(context.Background(), func(ready, skipped, processed int) {
-		if processed == configured || processed%50 < 2 {
-			log.Printf("account pool warmup: %d ready, %d skipped, %d configured", ready, skipped, configured)
+
+	bg := context.Background()
+	go p.Warm(bg, func(ready, skipped, processed int) {
+		if processed == p.Configured() || processed%50 < 2 {
+			log.Printf("account pool warmup: %d ready, %d skipped, %d configured", ready, skipped, p.Configured())
 		}
 	})
+	go p.WatchKeyFiles(bg, cfg, log.Printf)
 
 	sess := session.New()
 	sess.StartCleanup(5 * time.Minute)
