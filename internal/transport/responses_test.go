@@ -94,6 +94,59 @@ func TestResponsesRequestMergesAdditionalTools(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestConvertsAgentMessages(t *testing.T) {
+	req := responsesRequest{
+		Model: "public-model",
+		Input: json.RawMessage(`[
+			{
+				"type":"agent_message",
+				"id":"agent-1",
+				"author":"assistant",
+				"recipient":"user",
+				"content":[
+					{"type":"input_text","text":"previous answer"},
+					{"type":"encrypted_content","encrypted_content":"opaque-state"}
+				]
+			},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+		]`),
+	}
+
+	chat, _, err := req.chatRequest("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Messages) != 2 {
+		t.Fatalf("messages = %#v", chat.Messages)
+	}
+	if got := chat.Messages[0]; got.Role != "assistant" || got.Content != "previous answer" {
+		t.Fatalf("agent message = %#v", got)
+	}
+	if got := chat.Messages[1]; got.Role != "user" || got.Content != "continue" {
+		t.Fatalf("user message = %#v", got)
+	}
+}
+
+func TestResponsesRequestIgnoresEncryptedAgentMessageContent(t *testing.T) {
+	req := responsesRequest{
+		Model: "public-model",
+		Input: json.RawMessage(`[
+			{"type":"agent_message","author":"assistant","recipient":"user","content":[
+				{"type":"encrypted_content","encrypted_content":"opaque-state"}
+			]},
+			{"type":"message","role":"user","content":"continue"}
+		]`),
+	}
+
+	chat, _, err := req.chatRequest("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Messages) != 1 || chat.Messages[0].Role != "user" || chat.Messages[0].Content != "continue" {
+		t.Fatalf("messages = %#v", chat.Messages)
+	}
+}
+
 func TestResponsesRequestConvertsNamespacedCallHistory(t *testing.T) {
 	req := responsesRequest{
 		Model: "public-model",

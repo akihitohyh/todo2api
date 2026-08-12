@@ -234,6 +234,14 @@ func (r responsesRequest) chatRequest(todoID string) (openai.ChatRequest, map[st
 					return openai.ChatRequest{}, nil, fmt.Errorf("invalid message content: %w", err)
 				}
 				chat.Messages = append(chat.Messages, openai.ChatMessage{Role: role, Content: text})
+			case "agent_message":
+				text, err := responsesAgentMessageText(item.Content)
+				if err != nil {
+					return openai.ChatRequest{}, nil, fmt.Errorf("invalid agent_message content: %w", err)
+				}
+				if text != "" {
+					chat.Messages = append(chat.Messages, openai.ChatMessage{Role: "assistant", Content: text})
+				}
 			case "function_call":
 				callID := item.CallID
 				if callID == "" {
@@ -425,6 +433,32 @@ func responsesText(raw json.RawMessage) (string, error) {
 			text.WriteString(part.Refusal)
 		default:
 			return "", fmt.Errorf("unsupported content part %q", part.Type)
+		}
+	}
+	return text.String(), nil
+}
+
+func responsesAgentMessageText(raw json.RawMessage) (string, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil
+	}
+	if raw[0] == '"' {
+		return responsesText(raw)
+	}
+	var parts []responsesContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", err
+	}
+	var text strings.Builder
+	for _, part := range parts {
+		switch part.Type {
+		case "input_text", "output_text", "text":
+			text.WriteString(part.Text)
+		case "encrypted_content":
+			// Codex may retain opaque state beside the readable agent text.
+		default:
+			return "", fmt.Errorf("unsupported agent_message content part %q", part.Type)
 		}
 	}
 	return text.String(), nil
