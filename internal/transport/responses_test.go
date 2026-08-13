@@ -127,7 +127,7 @@ func TestResponsesRequestConvertsAgentMessages(t *testing.T) {
 	}
 }
 
-func TestResponsesRequestConvertsInputImagesToReferences(t *testing.T) {
+func TestResponsesRequestConvertsInputImagesToAttachments(t *testing.T) {
 	req := responsesRequest{
 		Model: "public-model",
 		Input: json.RawMessage(`[
@@ -151,8 +151,7 @@ func TestResponsesRequestConvertsInputImagesToReferences(t *testing.T) {
 		"Compare these images",
 		"https://example.com/a.png",
 		"https://example.com/b.jpg",
-		"data URL: image/png",
-		"detail=high",
+		"[image attached: image-1.png]",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("content %q does not contain %q", content, want)
@@ -160,6 +159,9 @@ func TestResponsesRequestConvertsInputImagesToReferences(t *testing.T) {
 	}
 	if strings.Contains(content, "AAAA") {
 		t.Fatalf("data URL payload leaked into prompt: %q", content)
+	}
+	if len(chat.Attachments) != 1 || chat.Attachments[0].MIMEType != "image/png" || string(chat.Attachments[0].Data) != "\x00\x00\x00" {
+		t.Fatalf("attachments = %#v", chat.Attachments)
 	}
 }
 

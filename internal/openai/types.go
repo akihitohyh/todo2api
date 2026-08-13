@@ -10,6 +10,14 @@ type ChatRequest struct {
 	Tools         []Tool            `json:"tools,omitempty"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
 	System        string            `json:"system,omitempty"` // Anthropic-style system parameter
+	Attachments   []AttachmentInput `json:"-"`
+}
+
+// AttachmentInput contains binary data extracted from a multimodal request.
+type AttachmentInput struct {
+	Name     string
+	MIMEType string
+	Data     []byte
 }
 
 type StreamOptions struct {

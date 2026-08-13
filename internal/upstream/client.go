@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -48,6 +50,105 @@ type Block struct {
 	Content string `json:"content"`
 	Result  string `json:"result"`
 	Status  string `json:"status"`
+}
+
+// AttachmentFrame is the metadata reference accepted by todo requests.
+type AttachmentFrame struct {
+	ID           string `json:"id"`
+	URI          string `json:"uri"`
+	OriginalName string `json:"originalName"`
+	MIMEType     string `json:"mimeType"`
+	FileSize     int64  `json:"fileSize"`
+	CreatedAt    int64  `json:"createdAt,omitempty"`
+	IsPublic     bool   `json:"isPublic,omitempty"`
+	Status       string `json:"status,omitempty"`
+}
+
+type AttachmentUpload struct {
+	Name     string
+	MIMEType string
+	Data     []byte
+}
+
+type registerAttachmentResp struct {
+	AttachmentID string `json:"attachmentId"`
+	ID           string `json:"id"`
+	URI          string `json:"uri"`
+	OriginalName string `json:"originalName"`
+	MIMEType     string `json:"mimeType"`
+	FileSize     int64  `json:"fileSize"`
+	CreatedAt    int64  `json:"createdAt"`
+	IsPublic     bool   `json:"isPublic"`
+	Status       string `json:"status"`
+}
+
+// RegisterAttachment uploads bytes through the attachment endpoint used by
+// the todofor.ai web client and returns the frame used in todo requests.
+func (c *Client) RegisterAttachment(ctx context.Context, upload AttachmentUpload, todoID string) (AttachmentFrame, error) {
+	if len(upload.Data) == 0 {
+		return AttachmentFrame{}, fmt.Errorf("attachment %q is empty", upload.Name)
+	}
+	name := filepath.Base(strings.TrimSpace(upload.Name))
+	if name == "." || name == "" {
+		name = "attachment"
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", name)
+	if err != nil {
+		return AttachmentFrame{}, err
+	}
+	if _, err := part.Write(upload.Data); err != nil {
+		return AttachmentFrame{}, err
+	}
+	if upload.MIMEType != "" {
+		_ = writer.WriteField("mimeType", upload.MIMEType)
+	}
+	if todoID != "" {
+		_ = writer.WriteField("todoId", todoID)
+	}
+	if err := writer.Close(); err != nil {
+		return AttachmentFrame{}, err
+	}
+	path := "/resources/register"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, &body)
+	if err != nil {
+		return AttachmentFrame{}, err
+	}
+	req.Header.Set("X-API-Key", c.apiKey)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return AttachmentFrame{}, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return AttachmentFrame{}, err
+	}
+	if resp.StatusCode >= 300 {
+		return AttachmentFrame{}, newHTTPError(http.MethodPost, path, resp.StatusCode, data)
+	}
+	var result registerAttachmentResp
+	if err := json.Unmarshal(data, &result); err != nil {
+		return AttachmentFrame{}, fmt.Errorf("decode registered attachment: %w", err)
+	}
+	if result.ID == "" {
+		result.ID = result.AttachmentID
+	}
+	if result.ID == "" || result.URI == "" {
+		return AttachmentFrame{}, fmt.Errorf("upstream returned incomplete attachment metadata")
+	}
+	if result.OriginalName == "" {
+		result.OriginalName = name
+	}
+	if result.MIMEType == "" {
+		result.MIMEType = upload.MIMEType
+	}
+	if result.FileSize == 0 {
+		result.FileSize = int64(len(upload.Data))
+	}
+	return AttachmentFrame{ID: result.ID, URI: result.URI, OriginalName: result.OriginalName, MIMEType: result.MIMEType, FileSize: result.FileSize, CreatedAt: result.CreatedAt, IsPublic: result.IsPublic, Status: result.Status}, nil
 }
 
 // RunMeta records one measured operation attached to an upstream message.
@@ -95,12 +196,17 @@ type RunMetaExtras struct {
 
 // AddMessage resumes an existing todo with a user/tool-result message.
 func (c *Client) AddMessage(ctx context.Context, projectID, todoID, content string, agent AgentSettings, filteredTools ...FilteredEdgeTools) (*Todo, error) {
+	return c.AddMessageWithAttachments(ctx, projectID, todoID, content, agent, nil, filteredTools...)
+}
+
+func (c *Client) AddMessageWithAttachments(ctx context.Context, projectID, todoID, content string, agent AgentSettings, attachments []AttachmentFrame, filteredTools ...FilteredEdgeTools) (*Todo, error) {
 	body := createTodoReq{
 		TodoID:        todoID,
 		ProjectID:     projectID,
 		Content:       content,
 		AgentSettings: agent,
 		FilteredTools: firstFilteredTools(filteredTools),
+		Attachments:   attachments,
 	}
 	var todo Todo
 	path := fmt.Sprintf("/projects/%s/todos", url.PathEscape(projectID))
@@ -205,6 +311,7 @@ type createTodoReq struct {
 	Content       string            `json:"content"`
 	AgentSettings AgentSettings     `json:"agentSettings"`
 	FilteredTools FilteredEdgeTools `json:"filteredEdgeTools,omitempty"`
+	Attachments   []AttachmentFrame `json:"attachments,omitempty"`
 	AutoDone      bool              `json:"autoDone,omitempty"`
 }
 
@@ -279,11 +386,16 @@ func (c *Client) FirstProject(ctx context.Context) (string, error) {
 
 // CreateTodo starts a new conversation and returns the created todo.
 func (c *Client) CreateTodo(ctx context.Context, projectID, content string, agent AgentSettings, filteredTools ...FilteredEdgeTools) (*Todo, error) {
+	return c.CreateTodoWithAttachments(ctx, projectID, content, agent, nil, filteredTools...)
+}
+
+func (c *Client) CreateTodoWithAttachments(ctx context.Context, projectID, content string, agent AgentSettings, attachments []AttachmentFrame, filteredTools ...FilteredEdgeTools) (*Todo, error) {
 	body := createTodoReq{
 		ProjectID:     projectID,
 		Content:       content,
 		AgentSettings: agent,
 		FilteredTools: firstFilteredTools(filteredTools),
+		Attachments:   attachments,
 	}
 	var todo Todo
 	path := fmt.Sprintf("/projects/%s/todos", url.PathEscape(projectID))
