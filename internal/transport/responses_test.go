@@ -127,6 +127,65 @@ func TestResponsesRequestConvertsAgentMessages(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestConvertsInputImagesToAttachments(t *testing.T) {
+	req := responsesRequest{
+		Model: "public-model",
+		Input: json.RawMessage(`[
+			{"type":"message","role":"user","content":[
+				{"type":"input_text","text":"Compare these images"},
+				{"type":"input_image","image_url":"https://example.com/a.png","detail":"high"},
+				{"type":"input_image","imageUrl":{"url":"https://example.com/b.jpg"}},
+				{"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+			]}
+		]`),
+	}
+	chat, _, err := req.chatRequest("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Messages) != 1 {
+		t.Fatalf("messages = %#v", chat.Messages)
+	}
+	content := chat.Messages[0].Content
+	for _, want := range []string{
+		"Compare these images",
+		"https://example.com/a.png",
+		"https://example.com/b.jpg",
+		"[image attached: image-1.png]",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("content %q does not contain %q", content, want)
+		}
+	}
+	if strings.Contains(content, "AAAA") {
+		t.Fatalf("data URL payload leaked into prompt: %q", content)
+	}
+	if len(chat.Attachments) != 1 || chat.Attachments[0].MIMEType != "image/png" || string(chat.Attachments[0].Data) != "\x00\x00\x00" {
+		t.Fatalf("attachments = %#v", chat.Attachments)
+	}
+}
+
+func TestResponsesRequestRejectsUnsupportedInputImageSources(t *testing.T) {
+	tests := []struct {
+		name string
+		part string
+		want string
+	}{
+		{name: "file id", part: `{"type":"input_image","file_id":"file_123"}`, want: "file_id"},
+		{name: "missing source", part: `{"type":"input_image"}`, want: "requires image_url or file_id"},
+		{name: "non image data", part: `{"type":"input_image","image_url":"data:text/plain;base64,AAAA"}`, want: "image MIME"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := responsesRequest{Model: "public-model", Input: json.RawMessage("[{\"type\":\"message\",\"role\":\"user\",\"content\":[" + tt.part + "]}]")}
+			_, _, err := req.chatRequest("")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestResponsesRequestIgnoresEncryptedAgentMessageContent(t *testing.T) {
 	req := responsesRequest{
 		Model: "public-model",

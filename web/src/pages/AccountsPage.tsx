@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Plus,
+  Upload,
   Trash2,
   Loader2,
   RefreshCw,
@@ -272,8 +273,11 @@ export function AccountsPage() {
   const [accounts, setAccounts] = useState<Account[] | null>(null);
   const [reloading, setReloading] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [bulkAdding, setBulkAdding] = useState(false);
   const [newKey, setNewKey] = useState("");
+  const [bulkKeys, setBulkKeys] = useState("");
   const [newProjectID, setNewProjectID] = useState("");
   const [newAgentID, setNewAgentID] = useState("");
 
@@ -457,6 +461,37 @@ export function AccountsPage() {
     }
   }
 
+  async function handleBulkAdd(e: React.FormEvent) {
+    e.preventDefault();
+    if (!bulkKeys.trim()) return;
+    setBulkAdding(true);
+    try {
+      const result = await api.bulkCreateAccounts({ keys: bulkKeys });
+      await load();
+      setBulkKeys("");
+      setBulkOpen(false);
+      const summary = `新增 ${result.created} 个，重复 ${result.duplicates} 个，失败 ${result.failed} 个`;
+      if (result.failed > 0) toast.error(summary);
+      else toast.success(summary);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "批量导入失败");
+    } finally {
+      setBulkAdding(false);
+    }
+  }
+
+  function handleBulkFile(file: File | undefined) {
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      toast.error("文件不能超过 2 MB");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setBulkKeys(String(reader.result ?? ""));
+    reader.onerror = () => toast.error("读取文件失败");
+    reader.readAsText(file);
+  }
+
   useEffect(() => {
     load();
 
@@ -637,6 +672,54 @@ export function AccountsPage() {
           </form>
         </DialogContent>
       </Dialog>
+      <Dialog
+        open={bulkOpen}
+        onOpenChange={(open) => {
+          if (!bulkAdding) setBulkOpen(open);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>批量导入 API Key</DialogTitle>
+            <DialogDescription>
+              每行一个 Key；空行、以 # 开头的注释和重复 Key 会自动忽略。
+            </DialogDescription>
+          </DialogHeader>
+          <form onSubmit={handleBulkAdd} className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="bulk-api-keys">API Keys</Label>
+              <textarea
+                id="bulk-api-keys"
+                value={bulkKeys}
+                onChange={(e) => setBulkKeys(e.target.value)}
+                placeholder={"key-one\nkey-two\n# optional comment"}
+                className="min-h-48 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                disabled={bulkAdding}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
+                <Upload size={14} />
+                从 TXT 文件读取
+                <input
+                  type="file"
+                  accept=".txt,text/plain"
+                  className="sr-only"
+                  onChange={(e) => handleBulkFile(e.target.files?.[0])}
+                  disabled={bulkAdding}
+                />
+              </label>
+              <Button type="submit" disabled={bulkAdding || !bulkKeys.trim()}>
+                {bulkAdding ? (
+                  <><Loader2 className="animate-spin" size={14} /> 导入中…</>
+                ) : (
+                  "开始导入"
+                )}
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
       {/* Reload progress modal */}
       <Dialog
         open={progressOpen}
@@ -785,6 +868,10 @@ export function AccountsPage() {
           <Button size="sm" className="gap-2" onClick={() => setAddOpen(true)}>
             <Plus size={14} />
             添加 API Key
+          </Button>
+          <Button variant="outline" size="sm" className="gap-2" onClick={() => setBulkOpen(true)}>
+            <Upload size={14} />
+            批量导入
           </Button>
         </div>
       </motion.div>

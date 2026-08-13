@@ -209,7 +209,11 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 		if content == "" {
 			return nil, fmt.Errorf("resumed request has no new user or tool-result messages")
 		}
-		if _, err := runtime.Client.AddMessage(runCtx, runtime.ProjectID, todoID, content, agent, filteredTools); err != nil {
+		attachments, err := registerAttachments(runCtx, runtime.Client, req.Attachments, todoID)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := runtime.Client.AddMessageWithAttachments(runCtx, runtime.ProjectID, todoID, content, agent, attachments, filteredTools); err != nil {
 			if handleErr := g.handleAccountFailure(acc, err); handleErr != nil {
 				return nil, handleErr
 			}
@@ -309,10 +313,15 @@ func (g *Gateway) startNewConversation(
 		sub, err := runtime.Client.PrepareSubscription(ctx)
 		if err == nil {
 			agent, filteredTools := g.accountRequestSettings(runtime, runnerModel, req)
-			var todo *upstream.Todo
-			todo, err = runtime.Client.CreateTodo(ctx, runtime.ProjectID, content, agent, filteredTools)
-			if err == nil {
-				return acc, runtime, sub, todo.ID, nil
+			attachments, uploadErr := registerAttachments(ctx, runtime.Client, req.Attachments, "")
+			if uploadErr != nil {
+				err = uploadErr
+			} else {
+				var todo *upstream.Todo
+				todo, err = runtime.Client.CreateTodoWithAttachments(ctx, runtime.ProjectID, content, agent, attachments, filteredTools)
+				if err == nil {
+					return acc, runtime, sub, todo.ID, nil
+				}
 			}
 		}
 
@@ -336,6 +345,23 @@ func (g *Gateway) startNewConversation(
 		return nil, pool.AccountRuntime{}, nil, "", fmt.Errorf("%w: %v", ErrAccountsUnavailable, lastErr)
 	}
 	return nil, pool.AccountRuntime{}, nil, "", ErrAccountsUnavailable
+}
+
+func registerAttachments(ctx context.Context, client *upstream.Client, inputs []openai.AttachmentInput, todoID string) ([]upstream.AttachmentFrame, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	frames := make([]upstream.AttachmentFrame, 0, len(inputs))
+	for _, input := range inputs {
+		frame, err := client.RegisterAttachment(ctx, upstream.AttachmentUpload{
+			Name: input.Name, MIMEType: input.MIMEType, Data: input.Data,
+		}, todoID)
+		if err != nil {
+			return nil, fmt.Errorf("register attachment %q: %w", input.Name, err)
+		}
+		frames = append(frames, frame)
+	}
+	return frames, nil
 }
 
 func (g *Gateway) handleAccountFailure(acc *pool.Account, cause error) error {

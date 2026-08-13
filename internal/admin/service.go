@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -23,6 +24,8 @@ import (
 )
 
 const cookieName = "todo2api-admin"
+
+const maxBulkAccountBody = 2 << 20 // 2 MiB keeps accidental uploads bounded.
 
 type Service struct {
 	cfg            *config.Config
@@ -109,10 +112,154 @@ func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/auth/check", s.handleCheck)
 	mux.HandleFunc("/api/auth/logout", s.requireAuth(s.sameOrigin(s.handleLogout)))
 	mux.HandleFunc("/api/accounts", s.requireAuth(s.sameOrigin(s.handleAccounts)))
+	mux.HandleFunc("/api/accounts/bulk", s.requireAuth(s.sameOrigin(s.handleBulkAccounts)))
 	mux.HandleFunc("/api/accounts/", s.requireAuth(s.sameOrigin(s.handleAccount)))
 	mux.HandleFunc("/api/stats", s.requireAuth(s.handleStats))
 	mux.HandleFunc("/api/stats/models", s.requireAuth(s.handleModelStats))
 	mux.HandleFunc("/api/events", s.requireAuth(s.handleEvents))
+}
+
+type bulkAccountResult struct {
+	APIKeyMasked string `json:"api_key_masked,omitempty"`
+	Status       string `json:"status"`
+	Error        string `json:"error,omitempty"`
+}
+
+type bulkAccountResponse struct {
+	Total      int                 `json:"total"`
+	Created    int                 `json:"created"`
+	Duplicates int                 `json:"duplicates"`
+	Failed     int                 `json:"failed"`
+	Results    []bulkAccountResult `json:"results"`
+}
+
+// handleBulkAccounts imports one API key per line. It accepts JSON
+// ({"keys":"..."} or {"keys":["..."]}) and multipart form uploads with a
+// file field named "file". Blank lines and # comments are ignored.
+func (s *Service) handleBulkAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBulkAccountBody)
+	keysText, projectID, agentID, err := decodeBulkAccountRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	keys := parseBulkKeys(keysText)
+	if len(keys) == 0 {
+		writeError(w, http.StatusBadRequest, "at least one api key is required")
+		return
+	}
+	result := bulkAccountResponse{Total: len(keys), Results: make([]bulkAccountResult, 0, len(keys))}
+	created := make([]storage.Account, 0, len(keys))
+	for _, key := range keys {
+		a, createErr := s.store.CreateAccount(r.Context(), config.AccountKey{APIKey: key, ProjectID: projectID, AgentID: agentID})
+		if createErr != nil {
+			if strings.Contains(strings.ToLower(createErr.Error()), "already exists") {
+				result.Duplicates++
+				result.Results = append(result.Results, bulkAccountResult{Status: "duplicate"})
+				continue
+			}
+			result.Failed++
+			result.Results = append(result.Results, bulkAccountResult{Status: "failed", Error: createErr.Error()})
+			continue
+		}
+		result.Created++
+		created = append(created, a)
+		result.Results = append(result.Results, bulkAccountResult{APIKeyMasked: a.APIKeyMasked, Status: "created"})
+	}
+	if len(created) > 0 {
+		s.hub.publish("accounts")
+		s.hub.publish("stats")
+		createdIDs := make([]int64, 0, len(created))
+		for _, account := range created {
+			createdIDs = append(createdIDs, account.ID)
+		}
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			if err := s.syncPool(s.ctx); err != nil {
+				log.Printf("sync pool after bulk add: %v", err)
+				for _, id := range createdIDs {
+					_ = s.store.SetHealthError(s.ctx, id, "error", err.Error())
+				}
+				s.hub.publish("accounts")
+				return
+			}
+			_ = s.startAutomaticRefreshAll()
+		}()
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func decodeBulkAccountRequest(r *http.Request) (keys, projectID, agentID string, err error) {
+	contentType := strings.ToLower(r.Header.Get("Content-Type"))
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if err = r.ParseMultipartForm(maxBulkAccountBody); err != nil {
+			return "", "", "", fmt.Errorf("invalid multipart upload: %w", err)
+		}
+		projectID = r.FormValue("project_id")
+		agentID = r.FormValue("agent_id")
+		if file, _, fileErr := r.FormFile("file"); fileErr == nil {
+			defer file.Close()
+			data, readErr := io.ReadAll(io.LimitReader(file, maxBulkAccountBody+1))
+			if readErr != nil {
+				return "", "", "", fmt.Errorf("read key file: %w", readErr)
+			}
+			if len(data) > maxBulkAccountBody {
+				return "", "", "", fmt.Errorf("key file is too large")
+			}
+			return string(data), projectID, agentID, nil
+		}
+		return r.FormValue("keys"), projectID, agentID, nil
+	}
+	var body struct {
+		Keys      json.RawMessage `json:"keys"`
+		APIKeys   json.RawMessage `json:"api_keys"`
+		ProjectID string          `json:"project_id"`
+		AgentID   string          `json:"agent_id"`
+	}
+	if err = json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return "", "", "", fmt.Errorf("invalid request body")
+	}
+	keysRaw := bytes.TrimSpace(body.Keys)
+	if len(bytes.TrimSpace(keysRaw)) == 0 {
+		keysRaw = bytes.TrimSpace(body.APIKeys)
+	}
+	if len(bytes.TrimSpace(keysRaw)) == 0 {
+		return "", "", "", fmt.Errorf("keys is required")
+	}
+	if keysRaw[0] == '"' {
+		if err = json.Unmarshal(keysRaw, &keys); err != nil {
+			return "", "", "", fmt.Errorf("keys must be a string or array")
+		}
+	} else {
+		var list []string
+		if err = json.Unmarshal(keysRaw, &list); err != nil {
+			return "", "", "", fmt.Errorf("keys must be a string or array")
+		}
+		keys = strings.Join(list, "\n")
+	}
+	return keys, body.ProjectID, body.AgentID, nil
+}
+
+func parseBulkKeys(input string) []string {
+	seen := make(map[string]struct{})
+	keys := make([]string, 0)
+	for _, line := range strings.Split(strings.ReplaceAll(input, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if _, exists := seen[line]; exists {
+			continue
+		}
+		seen[line] = struct{}{}
+		keys = append(keys, line)
+	}
+	return keys
 }
 
 func (s *Service) Run(ctx context.Context) {
