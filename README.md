@@ -217,13 +217,14 @@ curl http://localhost:8080/v1/responses \
 Set `"stream":true` and use `curl --no-buffer` to receive
 `response.output_text.delta` events before `response.completed`.
 
-Responses `input_image` parts are accepted in message content.
-`http://`/`https://` image URLs are preserved as explicit references in the
-upstream todo prompt (the image bytes are not uploaded by this bridge);
-`data:image/...` URLs are represented by a bounded MIME/size summary so large
-base64 payloads do not exhaust the todo context. `file_id` image inputs require
-an upstream attachment lookup and currently return a clear 400 error; send an
-`image_url` when using this gateway.
+Responses `input_image` parts are accepted in message content. `data:image/...`
+URLs are decoded and uploaded to todofor.ai's attachment endpoint, then sent as
+real todo attachments so vision-capable models can inspect the image bytes.
+Anthropic `/v1/messages` `image` blocks with a base64 source use the same path.
+Remote `http://`/`https://` URLs are preserved as references but are not fetched
+by this bridge; use a data URL for reliable image recognition. `file_id` image
+inputs require an upstream attachment lookup and currently return a clear 400
+error.
 
 Anthropic Messages request:
 
