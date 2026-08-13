@@ -397,6 +397,9 @@ func (g *Gateway) startNewConversationExcept(
 ) (*pool.Account, pool.AccountRuntime, *upstream.Subscription, string, error) {
 	content := openai.FlattenTurn(req.Messages)
 	attempts := g.pool.Len()
+	if attempts > maxNewConversationAttempts {
+		attempts = maxNewConversationAttempts
+	}
 	var lastErr error
 
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -518,6 +521,9 @@ const (
 	accountFailureCooldown
 	accountFailureRemove
 )
+
+// Keep failover bounded during provider-wide outages.
+const maxNewConversationAttempts = 8
 
 func accountFailurePolicy(err error) (accountFailureAction, time.Duration) {
 	if errors.Is(err, ErrFirstResponseTimeout) {
