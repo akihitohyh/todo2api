@@ -13,7 +13,7 @@ import {
   Power,
 } from "lucide-react";
 import { toast } from "sonner";
-import { api } from "@/api/client";
+import { api, ApiError } from "@/api/client";
 import type { Account, ReloadProgressResponse } from "@/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -287,6 +287,10 @@ export function AccountsPage() {
     invalid: 0,
   });
   const [isDone, setIsDone] = useState(false);
+  const [reloadScope, setReloadScope] = useState<"all" | "selected">("all");
+  const [reloadStartingScope, setReloadStartingScope] = useState<
+    "all" | "selected" | null
+  >(null);
   const reloadEsRef = useRef<EventSource | null>(null);
   const reloadRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reloadStreamActiveRef = useRef(false);
@@ -375,24 +379,47 @@ export function AccountsPage() {
 	};
   }
 
-  async function handleReload() {
-	closeReloadStream();
+  async function startReload(
+    scope: "all" | "selected",
+    accountIds?: number[],
+  ) {
     setReloading(true);
-    setProgress({ running: true, total: 0, done: 0, exhausted: 0, invalid: 0 });
-    setIsDone(false);
-    setProgressOpen(true);
+    setReloadStartingScope(scope);
 
     try {
-      await api.reloadAccounts(); // POST returns immediately; server fires goroutine
-	  reloadStreamActiveRef.current = true;
-	  connectReloadStream();
-    } catch {
-	  closeReloadStream();
-      toast.error("重新加载失败");
-      setProgressOpen(false);
+      await api.reloadAccounts(accountIds);
+	    closeReloadStream();
+      setReloadScope(scope);
+      setProgress({ running: true, total: 0, done: 0, exhausted: 0, invalid: 0 });
+      setIsDone(false);
+      setProgressOpen(true);
+	    reloadStreamActiveRef.current = true;
+	    connectReloadStream();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        toast.error("已有健康检查正在进行");
+      } else {
+        toast.error(err instanceof Error ? err.message : "健康检查启动失败");
+      }
     } finally {
       setReloading(false);
+      setReloadStartingScope(null);
     }
+  }
+
+  function handleReload() {
+    void startReload("all");
+  }
+
+  function handleReloadSelected() {
+    const accountIds = (accounts ?? [])
+      .filter((account) => selected.has(String(account.id)))
+      .map((account) => account.id);
+    if (accountIds.length === 0) {
+      toast.info("没有可检查的所选账号");
+      return;
+    }
+    void startReload("selected", accountIds);
   }
 
   function handleProgressClose() {
@@ -620,7 +647,11 @@ export function AccountsPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
-              {isDone ? "检查完成" : "正在检查账号健康状态…"}
+              {isDone
+                ? "检查完成"
+                : reloadScope === "selected"
+                  ? "正在检查所选账号健康状态…"
+                  : "正在检查账号健康状态…"}
             </DialogTitle>
           </DialogHeader>
           <div className="space-y-4 pt-2">
@@ -662,7 +693,9 @@ export function AccountsPage() {
             {isDone && (
               <div className="flex items-center justify-center gap-2 text-sm text-green-600 font-medium pt-1">
                 <CheckCircle2 size={16} />
-                所有账号健康状态已更新
+                {reloadScope === "selected"
+                  ? "所选账号健康状态已更新"
+                  : "所有账号健康状态已更新"}
               </div>
             )}
             <Button
@@ -733,7 +766,10 @@ export function AccountsPage() {
             disabled={reloading}
             className="gap-2"
           >
-            <RotateCcw size={14} className={reloading ? "animate-spin" : ""} />
+            <RotateCcw
+              size={14}
+              className={reloadStartingScope === "all" ? "animate-spin" : ""}
+            />
             健康检查
           </Button>
           <Button
@@ -760,18 +796,33 @@ export function AccountsPage() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.2 }}
-            className="flex items-center justify-between rounded-lg border border-primary/30 bg-primary/5 px-4 py-2.5 mb-4 text-sm"
+            className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between rounded-lg border border-primary/30 bg-primary/5 px-4 py-2.5 mb-4 text-sm"
           >
             <span className="font-medium text-foreground">
               已选 {selected.size} 个 API Key
             </span>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <Button
                 variant="ghost"
                 size="sm"
                 onClick={() => setSelected(new Set())}
               >
                 取消选择
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5"
+                onClick={handleReloadSelected}
+                disabled={reloading}
+              >
+                <RefreshCw
+                  size={13}
+                  className={
+                    reloadStartingScope === "selected" ? "animate-spin" : ""
+                  }
+                />
+                检查所选（{selected.size}）
               </Button>
               <Button
                 size="sm"

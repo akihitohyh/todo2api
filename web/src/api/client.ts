@@ -1,6 +1,17 @@
 import type { Account, DashboardStats, ModelStatsResponse } from "@/types";
 
 const BASE = "/api";
+
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -13,7 +24,7 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (res.status === 401) {
-    throw new Error("Unauthorized");
+    throw new ApiError(res.status, "Unauthorized");
   }
 
   if (res.status === 204) {
@@ -22,7 +33,14 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || `HTTP ${res.status}`);
+    let message = text;
+    try {
+      const body = JSON.parse(text) as { error?: string };
+      message = body.error || text;
+    } catch {
+      // Preserve non-JSON error responses.
+    }
+    throw new ApiError(res.status, message || `HTTP ${res.status}`);
   }
 
   return res.json() as Promise<T>;
@@ -57,8 +75,14 @@ export const api = {
     return apiFetch<Account[]>("/accounts");
   },
 
-  reloadAccounts(): Promise<{ status: string }> {
-    return apiFetch<{ status: string }>("/accounts/reload", { method: "POST" });
+  reloadAccounts(accountIds?: number[]): Promise<{ status: string }> {
+    return apiFetch<{ status: string }>("/accounts/reload", {
+      method: "POST",
+      body:
+        accountIds === undefined
+          ? undefined
+          : JSON.stringify({ account_ids: accountIds }),
+    });
   },
 
   getReloadProgressStreamURL(): string {
