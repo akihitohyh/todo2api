@@ -52,8 +52,35 @@ type Block struct {
 
 // RunMeta records one measured operation attached to an upstream message.
 type RunMeta struct {
+	Cost   float64       `json:"cost"`
 	Type   string        `json:"type"`
 	Extras RunMetaExtras `json:"extras"`
+}
+
+// BillingUsage is the authenticated account's current billing state.
+type BillingUsage struct {
+	TotalBalance              float64      `json:"totalBalance"`
+	ManualBalance             float64      `json:"manualBalance"`
+	SubscriptionBalance       float64      `json:"subscriptionBalance"`
+	Tier                      string       `json:"tier"`
+	HasActivePaidSubscription bool         `json:"hasActivePaidSubscription"`
+	CreditLimit               float64      `json:"creditLimit"`
+	MonthlyTopUp              *float64     `json:"monthlyTopUp"`
+	Session                   *UsageWindow `json:"session"`
+	Weekly                    *UsageWindow `json:"weekly"`
+}
+
+type UsageWindow struct {
+	UsedPercent float64 `json:"usedPercent"`
+	ResetsAt    float64 `json:"resetsAt"`
+}
+
+func (c *Client) BillingUsage(ctx context.Context) (BillingUsage, error) {
+	var usage BillingUsage
+	if err := c.do(ctx, http.MethodGet, "/billing/usage", nil, &usage); err != nil {
+		return BillingUsage{}, err
+	}
+	return usage, nil
 }
 
 // RunMetaExtras contains the token counters reported for an AI operation.

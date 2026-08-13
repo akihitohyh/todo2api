@@ -2,13 +2,13 @@ package config
 
 import (
 	"bufio"
-	"bytes"
+	"encoding/base64"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -18,19 +18,21 @@ const (
 	defaultAddr        = ":8080"
 	defaultBaseURL     = "https://api.todofor.ai/api/v1"
 	defaultPollTimeout = 5 * time.Minute
+	defaultStoragePath = "data/todo2api.db"
+	defaultSessionTTL  = 12 * time.Hour
 )
 
 type Config struct {
 	Server       ServerConfig       `yaml:"server"`
 	Upstream     UpstreamConfig     `yaml:"upstream"`
 	Pool         PoolConfig         `yaml:"pool"`
+	Storage      StorageConfig      `yaml:"storage"`
+	Web          WebConfig          `yaml:"web"`
 	Models       ModelsConfig       `yaml:"models"`
 	Edge         EdgeConfig         `yaml:"edge"`
 	ToolProtocol ToolProtocolConfig `yaml:"tool_protocol"`
 
-	mu           sync.Mutex
-	sourcePath   string
-	keyFilePaths []string
+	sourcePath string
 }
 
 type ServerConfig struct {
@@ -50,9 +52,24 @@ type PoolConfig struct {
 }
 
 type AccountKey struct {
+	ID        int64  `yaml:"-"`
 	APIKey    string `yaml:"api_key"`
 	ProjectID string `yaml:"project_id"`
 	AgentID   string `yaml:"agent_id"`
+	Enabled   bool   `yaml:"-"`
+}
+
+type StorageConfig struct {
+	Path      string `yaml:"path"`
+	MasterKey string `yaml:"master_key"`
+}
+
+type WebConfig struct {
+	AdminUsername  string        `yaml:"admin_username"`
+	AdminPassword  string        `yaml:"admin_password"`
+	SessionTTL     time.Duration `yaml:"session_ttl"`
+	SecureCookie   bool          `yaml:"secure_cookie"`
+	TrustedProxies []string      `yaml:"trusted_proxies"`
 }
 
 type ModelsConfig struct {
@@ -111,9 +128,6 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(data))), &cfg); err != nil {
 		return nil, fmt.Errorf("decode YAML: %w", err)
 	}
-	if err := cfg.loadKeyFiles(filepath.Dir(absPath)); err != nil {
-		return nil, err
-	}
 	cfg.setDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -121,68 +135,10 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// LoadPoolKeys re-reads the config source and key_files from disk and returns
-// the merged key set. Used for hot-reload so permanent RemovePoolKey rewrites
-// are respected. Does not mutate c.Pool.Keys; updates c.keyFilePaths under lock.
-func (c *Config) LoadPoolKeys() ([]AccountKey, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	tmp := &Config{sourcePath: c.sourcePath}
-	if c.sourcePath != "" {
-		data, err := os.ReadFile(c.sourcePath)
-		if err != nil {
-			return nil, fmt.Errorf("read config for key reload: %w", err)
-		}
-		if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(data))), tmp); err != nil {
-			return nil, fmt.Errorf("decode YAML for key reload: %w", err)
-		}
-	} else {
-		tmp.Pool.Keys = append([]AccountKey(nil), c.Pool.Keys...)
-		tmp.Pool.KeyFiles = append([]string(nil), c.Pool.KeyFiles...)
-	}
-
-	configDir := ""
-	if c.sourcePath != "" {
-		configDir = filepath.Dir(c.sourcePath)
-	}
-	if err := tmp.loadKeyFiles(configDir); err != nil {
-		return nil, err
-	}
-	c.keyFilePaths = append([]string(nil), tmp.keyFilePaths...)
-	c.Pool.KeyFiles = append([]string(nil), tmp.Pool.KeyFiles...)
-	return append([]AccountKey(nil), tmp.Pool.Keys...), nil
-}
-
-// ResolvedKeyFilePaths returns absolute paths for configured pool.key_files.
-func (c *Config) ResolvedKeyFilePaths() ([]string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.keyFilePaths) > 0 {
-		return append([]string(nil), c.keyFilePaths...), nil
-	}
-	configDir := ""
-	if c.sourcePath != "" {
-		configDir = filepath.Dir(c.sourcePath)
-	}
-	paths := make([]string, 0, len(c.Pool.KeyFiles))
-	for _, configuredPath := range c.Pool.KeyFiles {
-		path := os.ExpandEnv(strings.TrimSpace(configuredPath))
-		if path == "" {
-			return nil, fmt.Errorf("pool.key_files must not contain an empty path")
-		}
-		if !filepath.IsAbs(path) {
-			if configDir == "" {
-				return nil, fmt.Errorf("pool.key_files relative path %q requires a loaded config path", path)
-			}
-			path = filepath.Join(configDir, path)
-		}
-		paths = append(paths, filepath.Clean(path))
-	}
-	return paths, nil
-}
-
-func (c *Config) loadKeyFiles(configDir string) error {
+// LegacyPoolKeys reads the retired YAML/file storage format. It is called only
+// by the SQLite store before it writes the one-time migration marker.
+func (c *Config) LegacyPoolKeys() ([]AccountKey, error) {
+	configDir := filepath.Dir(c.sourcePath)
 	seen := make(map[string]struct{}, len(c.Pool.Keys))
 	keys := make([]AccountKey, 0, len(c.Pool.Keys))
 	appendKey := func(key AccountKey) {
@@ -200,20 +156,18 @@ func (c *Config) loadKeyFiles(configDir string) error {
 		appendKey(key)
 	}
 
-	c.keyFilePaths = c.keyFilePaths[:0]
 	for _, configuredPath := range c.Pool.KeyFiles {
 		path := os.ExpandEnv(strings.TrimSpace(configuredPath))
 		if path == "" {
-			return fmt.Errorf("pool.key_files must not contain an empty path")
+			return nil, fmt.Errorf("pool.key_files must not contain an empty path")
 		}
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(configDir, path)
 		}
 		path = filepath.Clean(path)
-		c.keyFilePaths = append(c.keyFilePaths, path)
 		file, err := os.Open(path)
 		if err != nil {
-			return fmt.Errorf("open pool key file %s: %w", path, err)
+			return nil, fmt.Errorf("open pool key file %s: %w", path, err)
 		}
 		scanner := bufio.NewScanner(file)
 		line := 0
@@ -228,195 +182,13 @@ func (c *Config) loadKeyFiles(configDir string) error {
 		scanErr := scanner.Err()
 		closeErr := file.Close()
 		if scanErr != nil {
-			return fmt.Errorf("read pool key file %s at line %d: %w", path, line, scanErr)
+			return nil, fmt.Errorf("read pool key file %s at line %d: %w", path, line, scanErr)
 		}
 		if closeErr != nil {
-			return fmt.Errorf("close pool key file %s: %w", path, closeErr)
+			return nil, fmt.Errorf("close pool key file %s: %w", path, closeErr)
 		}
 	}
-	c.Pool.Keys = keys
-	return nil
-}
-
-// RemovePoolKey deletes an account key from every configured source and from
-// the loaded configuration. Rewrites use fsync plus rename so a crash cannot
-// leave a partially written credential file.
-func (c *Config) RemovePoolKey(apiKey string) error {
-	apiKey = strings.TrimSpace(apiKey)
-	if apiKey == "" {
-		return nil
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	type rewrite struct {
-		path string
-		data []byte
-		mode os.FileMode
-	}
-	var rewrites []rewrite
-
-	if c.sourcePath != "" {
-		data, err := os.ReadFile(c.sourcePath)
-		if err != nil {
-			return fmt.Errorf("read config for key removal: %w", err)
-		}
-		updated, changed, err := removeInlinePoolKey(data, apiKey)
-		if err != nil {
-			return fmt.Errorf("remove key from config: %w", err)
-		}
-		if changed {
-			info, err := os.Stat(c.sourcePath)
-			if err != nil {
-				return fmt.Errorf("stat config for key removal: %w", err)
-			}
-			rewrites = append(rewrites, rewrite{path: c.sourcePath, data: updated, mode: info.Mode()})
-		}
-	}
-
-	for _, path := range c.keyFilePaths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("read pool key file %s for key removal: %w", path, err)
-		}
-		updated, changed := removeKeyFileEntry(data, apiKey)
-		if !changed {
-			continue
-		}
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("stat pool key file %s for key removal: %w", path, err)
-		}
-		rewrites = append(rewrites, rewrite{path: path, data: updated, mode: info.Mode()})
-	}
-
-	for _, rewrite := range rewrites {
-		if err := atomicWriteFile(rewrite.path, rewrite.data, rewrite.mode); err != nil {
-			return err
-		}
-	}
-
-	keys := c.Pool.Keys[:0]
-	for _, key := range c.Pool.Keys {
-		if strings.TrimSpace(key.APIKey) != apiKey {
-			keys = append(keys, key)
-		}
-	}
-	c.Pool.Keys = keys
-	return nil
-}
-
-func removeInlinePoolKey(data []byte, apiKey string) ([]byte, bool, error) {
-	var document yaml.Node
-	if err := yaml.Unmarshal(data, &document); err != nil {
-		return nil, false, err
-	}
-	if len(document.Content) == 0 {
-		return data, false, nil
-	}
-
-	root := document.Content[0]
-	pool := mappingValue(root, "pool")
-	keys := mappingValue(pool, "keys")
-	if keys == nil || keys.Kind != yaml.SequenceNode {
-		return data, false, nil
-	}
-
-	filtered := keys.Content[:0]
-	changed := false
-	for _, item := range keys.Content {
-		value := mappingValue(item, "api_key")
-		if value != nil && strings.TrimSpace(os.ExpandEnv(value.Value)) == apiKey {
-			changed = true
-			continue
-		}
-		filtered = append(filtered, item)
-	}
-	if !changed {
-		return data, false, nil
-	}
-	keys.Content = filtered
-
-	var output bytes.Buffer
-	encoder := yaml.NewEncoder(&output)
-	encoder.SetIndent(2)
-	if err := encoder.Encode(&document); err != nil {
-		return nil, false, err
-	}
-	if err := encoder.Close(); err != nil {
-		return nil, false, err
-	}
-	return output.Bytes(), true, nil
-}
-
-func mappingValue(node *yaml.Node, key string) *yaml.Node {
-	if node == nil || node.Kind != yaml.MappingNode {
-		return nil
-	}
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i].Value == key {
-			return node.Content[i+1]
-		}
-	}
-	return nil
-}
-
-func removeKeyFileEntry(data []byte, apiKey string) ([]byte, bool) {
-	lines := bytes.SplitAfter(data, []byte("\n"))
-	kept := lines[:0]
-	changed := false
-	for _, line := range lines {
-		value := strings.TrimSpace(strings.TrimSuffix(string(line), "\n"))
-		if value == apiKey {
-			changed = true
-			continue
-		}
-		kept = append(kept, line)
-	}
-	return bytes.Join(kept, nil), changed
-}
-
-func atomicWriteFile(path string, data []byte, mode os.FileMode) (err error) {
-	dir := filepath.Dir(path)
-	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temporary file for %s: %w", path, err)
-	}
-	tempPath := temp.Name()
-	defer func() {
-		temp.Close()
-		if err != nil {
-			os.Remove(tempPath)
-		}
-	}()
-
-	if err = temp.Chmod(mode.Perm()); err != nil {
-		return fmt.Errorf("set mode on temporary file for %s: %w", path, err)
-	}
-	if _, err = temp.Write(data); err != nil {
-		return fmt.Errorf("write temporary file for %s: %w", path, err)
-	}
-	if err = temp.Sync(); err != nil {
-		return fmt.Errorf("sync temporary file for %s: %w", path, err)
-	}
-	if err = temp.Close(); err != nil {
-		return fmt.Errorf("close temporary file for %s: %w", path, err)
-	}
-	if err = os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("replace %s: %w", path, err)
-	}
-
-	// Best-effort directory sync. On some platforms (notably Windows) this can
-	// fail with access denied even after a successful rename; the payload was
-	// already fsynced before rename.
-	directory, openErr := os.Open(dir)
-	if openErr != nil {
-		return nil
-	}
-	_ = directory.Sync()
-	_ = directory.Close()
-	return nil
+	return keys, nil
 }
 
 func (c *Config) setDefaults() {
@@ -432,6 +204,16 @@ func (c *Config) setDefaults() {
 	}
 	if c.Pool.Strategy == "" {
 		c.Pool.Strategy = "round_robin"
+	}
+	if c.Storage.Path == "" {
+		c.Storage.Path = defaultStoragePath
+	}
+	if !filepath.IsAbs(c.Storage.Path) {
+		c.Storage.Path = filepath.Join(filepath.Dir(c.sourcePath), c.Storage.Path)
+	}
+	c.Storage.Path = filepath.Clean(c.Storage.Path)
+	if c.Web.SessionTTL == 0 {
+		c.Web.SessionTTL = defaultSessionTTL
 	}
 	if c.Models.Aliases == nil {
 		c.Models.Aliases = map[string]string{}
@@ -452,13 +234,38 @@ func (c *Config) Validate() error {
 	if c.Pool.Strategy != "round_robin" && c.Pool.Strategy != "least_busy" {
 		return fmt.Errorf("pool.strategy must be round_robin or least_busy")
 	}
-	if len(c.Pool.Keys) == 0 {
-		return fmt.Errorf("pool.keys must contain at least one account")
+	if _, err := c.MasterKey(); err != nil {
+		return err
+	}
+	clientTokens := make(map[string]struct{}, len(c.Server.ClientTokens))
+	for i, token := range c.Server.ClientTokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			return fmt.Errorf("server.client_tokens[%d] must not be empty", i)
+		}
+		if _, exists := clientTokens[token]; exists {
+			return fmt.Errorf("server.client_tokens[%d] duplicates an earlier token", i)
+		}
+		clientTokens[token] = struct{}{}
+		c.Server.ClientTokens[i] = token
 	}
 	for i, key := range c.Pool.Keys {
 		if strings.TrimSpace(key.APIKey) == "" {
 			return fmt.Errorf("pool.keys[%d].api_key must not be empty", i)
 		}
+	}
+	if strings.TrimSpace(c.Web.AdminUsername) == "" || c.Web.AdminPassword == "" {
+		return fmt.Errorf("web.admin_username and web.admin_password must be configured")
+	}
+	if c.Web.SessionTTL <= 0 {
+		return fmt.Errorf("web.session_ttl must be positive")
+	}
+	for i, cidr := range c.Web.TrustedProxies {
+		cidr = strings.TrimSpace(cidr)
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("web.trusted_proxies[%d] must be a valid CIDR", i)
+		}
+		c.Web.TrustedProxies[i] = cidr
 	}
 	if c.Models.Default == "" && len(c.Models.Aliases) == 0 {
 		return fmt.Errorf("models.default or models.aliases must be configured")
@@ -472,4 +279,14 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// MasterKey decodes the mandatory AES-256 master key from the loaded config.
+func (c *Config) MasterKey() ([]byte, error) {
+	raw := strings.TrimSpace(c.Storage.MasterKey)
+	key, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("storage.master_key must be base64-encoded 32 bytes")
+	}
+	return key, nil
 }

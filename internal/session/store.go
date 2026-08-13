@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -75,10 +76,20 @@ func (s *Store) Put(key string, e Entry) {
 
 // StartCleanup periodically removes expired session state.
 func (s *Store) StartCleanup(interval time.Duration) {
+	s.StartCleanupContext(context.Background(), interval)
+}
+
+func (s *Store) StartCleanupContext(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	go func() {
-		for range ticker.C {
-			s.cleanup()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.cleanup()
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 }

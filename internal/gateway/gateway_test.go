@@ -17,8 +17,27 @@ import (
 	"todo2api/internal/openai"
 	"todo2api/internal/pool"
 	"todo2api/internal/session"
+	"todo2api/internal/storage"
 	"todo2api/internal/upstream"
 )
+
+type recordedCall struct {
+	model   string
+	usage   storage.Usage
+	success bool
+}
+
+type testCallRecorder struct {
+	mu    sync.Mutex
+	calls []recordedCall
+}
+
+func (r *testCallRecorder) RecordCall(_ context.Context, model string, usage storage.Usage, success bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, recordedCall{model: model, usage: usage, success: success})
+	return nil
+}
 
 func TestCompleteToolCallContinuationAndMetadataFallback(t *testing.T) {
 	mock := newMockUpstream(t)
@@ -79,7 +98,7 @@ func TestCompleteToolCallContinuationAndMetadataFallback(t *testing.T) {
 		t.Fatalf("public response model = %q", first.Model)
 	}
 	if first.Usage != (TokenUsage{
-		InputTokens: 852, OutputTokens: 11, CacheReadTokens: 1536, Available: true,
+		InputTokens: 852, OutputTokens: 11, CacheReadTokens: 1536, Available: true, Cost: 1.25,
 	}) {
 		t.Fatalf("first usage = %#v", first.Usage)
 	}
@@ -289,7 +308,7 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 				{
 					"id": "assistant-message", "todoId": "todo-1", "role": "assistant", "content": m.assistantContent,
 					"runMeta": []map[string]any{{
-						"type": "todo:msg_meta_ai",
+						"type": "todo:msg_meta_ai", "cost": 1.25,
 						"extras": map[string]any{
 							"inputTokens": 852, "outputTokens": 11, "cacheReadTokens": 1536, "contextTokens": 2399,
 						},
@@ -531,6 +550,46 @@ func TestStreamEmitsTextBeforeReady(t *testing.T) {
 	}
 	if len(events) != 3 || events[0].Type != StreamStart || events[1].Delta != "hello" || events[2].Delta != " world" {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestCallRecorderCountsEachGatewayInvocationOnce(t *testing.T) {
+	mock := newMockUpstream(t)
+	mock.mu.Lock()
+	mock.streamFragments = []string{"hello"}
+	mock.mu.Unlock()
+
+	recorder := &testCallRecorder{}
+	gw := newTestGateway(t, mock)
+	gw.recorder = recorder
+	if _, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model: "public-model", Messages: []openai.ChatMessage{{Role: "user", Content: "first"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gw.Stream(context.Background(), openai.ChatRequest{
+		Model: "public-model", Messages: []openai.ChatMessage{{Role: "user", Content: "second"}},
+	}, func(StreamEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model: "public-model", Metadata: map[string]string{openai.TodoIDMetadataKey: "missing"},
+	}); err == nil {
+		t.Fatal("unknown explicit todo unexpectedly succeeded")
+	}
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.calls) != 3 {
+		t.Fatalf("recorded calls=%#v", recorder.calls)
+	}
+	for i, call := range recorder.calls[:2] {
+		if !call.success || call.model != "public-model" || call.usage.InputTokens != 852 || call.usage.OutputTokens != 11 || call.usage.Cost != 1.25 {
+			t.Fatalf("success call %d=%#v", i, call)
+		}
+	}
+	if recorder.calls[2].success {
+		t.Fatalf("failed call recorded as success: %#v", recorder.calls[2])
 	}
 }
 

@@ -3,15 +3,30 @@ server:
   client_tokens:
     - "sk-todo2api-changeme"
 
+storage:
+  # Relative paths resolve from this configuration file.
+  path: "data/todo2api.db"
+  # Generate once with: openssl rand -base64 32
+  # Keep this value unchanged after the database has been created.
+  master_key: "REPLACE_WITH_BASE64_ENCODED_32_BYTE_KEY"
+
+web:
+  admin_username: "admin"
+  admin_password: "change-me"
+  session_ttl: 12h
+  secure_cookie: false # Set true when serving over HTTPS.
+  # Forwarded headers are accepted only from these proxy source networks.
+  # The proxy must overwrite X-Forwarded-For/Host/Proto from clients.
+  trusted_proxies: [] # Example: ["127.0.0.1/32", "::1/128"]
+
 upstream:
   base_url: "https://api.todofor.ai/api/v1"
   poll_timeout: 5m
 
 pool:
   strategy: "round_robin" # round_robin or least_busy
-  # Optional files contain one API key per line. Relative paths resolve from
-  # this config file. Blank lines, comments, and duplicate keys are ignored.
-  # Files are watched at runtime: add/remove lines to hot-update the pool.
+  # Legacy one-time import sources. After the first successful database start,
+  # these values are retained only for rollback and are never read again.
   key_files: []
   keys:
     - api_key: "${TODOFOR_API_KEY}"
