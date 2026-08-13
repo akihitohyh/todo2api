@@ -296,7 +296,7 @@ func (r responsesRequest) chatRequest(todoID string) (openai.ChatRequest, map[st
 				})
 			case "additional_tools":
 				effectiveTools = append(effectiveTools, item.Tools...)
-			case "reasoning", "item_reference":
+			case "compaction", "reasoning", "item_reference":
 				// These items carry OpenAI-internal state that todofor.ai cannot consume.
 			default:
 				return openai.ChatRequest{}, nil, fmt.Errorf("unsupported input item type %q", item.Type)
