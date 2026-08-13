@@ -92,6 +92,23 @@ export const api = {
     });
   },
 
+  bulkCreateAccounts(input: {
+    keys: string;
+    project_id?: string;
+    agent_id?: string;
+  }): Promise<{
+    total: number;
+    created: number;
+    duplicates: number;
+    failed: number;
+    results: { api_key_masked?: string; status: string; error?: string }[];
+  }> {
+    return apiFetch("/accounts/bulk", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  },
+
   setAccountEnabled(id: number, enabled: boolean): Promise<Account> {
     return apiFetch<Account>(`/accounts/${id}`, {
       method: "PATCH",

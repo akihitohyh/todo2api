@@ -73,8 +73,9 @@ go run ./cmd/todo2api -config config.yaml
 
 Open `http://localhost:8080` and sign in with `web.admin_username` and
 `web.admin_password`. The WebUI manages API keys, health checks, balances, and
-local gateway usage statistics. Registration automation is intentionally
-disabled.
+local gateway usage statistics. The account page can also bulk-import keys by
+pasting one key per line or selecting a TXT file; blank lines, comments, and
+duplicates are ignored. Registration automation is intentionally disabled.
 
 ## Build for Linux
 
@@ -176,6 +177,19 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+批量导入 API Key（管理会话登录后）：
+
+```bash
+curl http://localhost:8080/api/accounts/bulk \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: http://localhost:8080' \
+  -b 'todo2api-admin=<session-cookie>' \
+  -d '{"keys":"key-one\nkey-two\n# comment"}'
+```
+
+也可以把同样的内容作为 `multipart/form-data` 的 `file` 字段上传；接口会
+忽略空行、整行注释和重复 Key，并只返回脱敏结果统计。
+
 Incremental Chat Completions stream:
 
 ```bash
@@ -202,6 +216,14 @@ curl http://localhost:8080/v1/responses \
 
 Set `"stream":true` and use `curl --no-buffer` to receive
 `response.output_text.delta` events before `response.completed`.
+
+Responses `input_image` parts are accepted in message content.
+`http://`/`https://` image URLs are preserved as explicit references in the
+upstream todo prompt (the image bytes are not uploaded by this bridge);
+`data:image/...` URLs are represented by a bounded MIME/size summary so large
+base64 payloads do not exhaust the todo context. `file_id` image inputs require
+an upstream attachment lookup and currently return a clear 400 error; send an
+`image_url` when using this gateway.
 
 Anthropic Messages request:
 
