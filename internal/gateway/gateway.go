@@ -34,6 +34,12 @@ type CallRecorder interface {
 
 var ErrAccountsUnavailable = errors.New("all upstream accounts are unavailable")
 
+// ErrEmptyCompletion means the upstream reported a completed run but did not
+// expose either assistant text or authoritative usage metadata. Treating this
+// as success makes clients observe an empty answer (and usage=0), so new
+// conversations use it as a signal to try another account.
+var ErrEmptyCompletion = errors.New("Upstream returned an empty completion without usage")
+
 func New(cfg *config.Config, p *pool.Pool, s *session.Store, recorders ...CallRecorder) *Gateway {
 	g := &Gateway{cfg: cfg, pool: p, sess: s}
 	if len(recorders) > 0 {
@@ -187,6 +193,8 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 	var sub *upstream.Subscription
 	var runtime pool.AccountRuntime
 	todoID := entry.TodoID
+	var result assistantResult
+	var err error
 	if resuming {
 		acc.Acquire()
 		defer acc.Release()
@@ -194,7 +202,6 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 		if runtime.Client == nil {
 			return nil, fmt.Errorf("session account client is unavailable")
 		}
-		var err error
 		sub, err = runtime.Client.PrepareSubscription(runCtx)
 		if err != nil {
 			if handleErr := g.handleAccountFailure(acc, err); handleErr != nil {
@@ -219,38 +226,100 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 			}
 			return nil, err
 		}
-	} else {
-		var err error
-		acc, runtime, sub, todoID, err = g.startNewConversation(runCtx, req, runnerModel)
+		if emit != nil {
+			if err := emit(StreamEvent{Type: StreamStart, Model: publicModel, TodoID: todoID}); err != nil {
+				return nil, fmt.Errorf("emit stream start: %w", err)
+			}
+		}
+		var emitText func(string) error
+		if emit != nil {
+			emitText = func(delta string) error {
+				return emit(StreamEvent{Type: StreamTextDelta, Model: publicModel, TodoID: todoID, Delta: delta})
+			}
+		}
+		result, err = g.waitAssistant(runCtx, sub, runtime.Client, todoID, emitText)
+		if err == nil && result.Content == "" && !result.Usage.Available {
+			err = ErrEmptyCompletion
+		}
 		if err != nil {
+			if handleErr := g.handleAccountFailure(acc, err); handleErr != nil {
+				return nil, handleErr
+			}
 			return nil, err
 		}
-		defer acc.Release()
-		defer sub.Close()
+	} else {
+		excluded := make(map[*pool.Account]struct{})
+		for {
+			acc, runtime, sub, todoID, err = g.startNewConversationExcept(runCtx, req, runnerModel, excluded)
+			if err != nil {
+				return nil, err
+			}
+			if todoID == "" {
+				sub.Close()
+				acc.Release()
+				return nil, fmt.Errorf("upstream returned an empty todo id")
+			}
+
+			if emit != nil {
+				if err := emit(StreamEvent{Type: StreamStart, Model: publicModel, TodoID: todoID}); err != nil {
+					sub.Close()
+					acc.Release()
+					return nil, fmt.Errorf("emit stream start: %w", err)
+				}
+			}
+
+			var emitText func(string) error
+			if emit != nil {
+				emitText = func(delta string) error {
+					return emit(StreamEvent{
+						Type: StreamTextDelta, Model: publicModel, TodoID: todoID, Delta: delta,
+					})
+				}
+			}
+			result, err = g.waitAssistant(runCtx, sub, runtime.Client, todoID, emitText)
+			empty := err == nil && result.Content == "" && !result.Usage.Available
+			if err == nil && !empty {
+				defer acc.Release()
+				defer sub.Close()
+				break
+			}
+
+			// A streaming response has already sent its start (and possibly text),
+			// so retrying it would duplicate protocol output. Non-streaming new
+			// conversations can safely be recreated on another account.
+			failure := err
+			if empty {
+				failure = ErrEmptyCompletion
+			}
+			sub.Close()
+			acc.Release()
+			if emit != nil {
+				if handleErr := g.handleAccountFailure(acc, failure); handleErr != nil {
+					return nil, handleErr
+				}
+				if empty {
+					return nil, fmt.Errorf("%w; no fallback account was available", failure)
+				}
+				return nil, failure
+			}
+			action, cooldown := accountFailurePolicy(failure)
+			if action == accountFailureNone {
+				return nil, failure
+			}
+			if handleErr := g.applyAccountFailure(acc, action, cooldown, failure); handleErr != nil {
+				return nil, handleErr
+			}
+			excluded[acc] = struct{}{}
+			if g.pool.PickExcept(excluded) == nil {
+				if empty {
+					return nil, fmt.Errorf("%w; no fallback account was available", failure)
+				}
+				return nil, fmt.Errorf("%w: %v", ErrAccountsUnavailable, failure)
+			}
+		}
 	}
 	if todoID == "" {
 		return nil, fmt.Errorf("upstream returned an empty todo id")
-	}
-	if emit != nil {
-		if err := emit(StreamEvent{Type: StreamStart, Model: publicModel, TodoID: todoID}); err != nil {
-			return nil, fmt.Errorf("emit stream start: %w", err)
-		}
-	}
-
-	var emitText func(string) error
-	if emit != nil {
-		emitText = func(delta string) error {
-			return emit(StreamEvent{
-				Type: StreamTextDelta, Model: publicModel, TodoID: todoID, Delta: delta,
-			})
-		}
-	}
-	result, err := g.waitAssistant(runCtx, sub, runtime.Client, todoID, emitText)
-	if err != nil {
-		if handleErr := g.handleAccountFailure(acc, err); handleErr != nil {
-			return nil, handleErr
-		}
-		return nil, err
 	}
 	content := result.Content
 	text, calls := openai.ParseToolCalls(content)
@@ -292,6 +361,15 @@ func (g *Gateway) startNewConversation(
 	runnerModel string,
 ) (*pool.Account, pool.AccountRuntime, *upstream.Subscription, string, error) {
 	excluded := make(map[*pool.Account]struct{})
+	return g.startNewConversationExcept(ctx, req, runnerModel, excluded)
+}
+
+func (g *Gateway) startNewConversationExcept(
+	ctx context.Context,
+	req openai.ChatRequest,
+	runnerModel string,
+	excluded map[*pool.Account]struct{},
+) (*pool.Account, pool.AccountRuntime, *upstream.Subscription, string, error) {
 	content := openai.FlattenTurn(req.Messages)
 	attempts := g.pool.Len()
 	var lastErr error
@@ -417,30 +495,60 @@ const (
 )
 
 func accountFailurePolicy(err error) (accountFailureAction, time.Duration) {
+	if errors.Is(err, ErrEmptyCompletion) {
+		// A completed run with no body is usually a transient upstream/account
+		// failure. Give this key a short cooldown and let a new conversation
+		// try another account.
+		return accountFailureCooldown, 30 * time.Second
+	}
+
 	var upstreamErr *upstream.HTTPError
-	if !errors.As(err, &upstreamErr) {
+	if errors.As(err, &upstreamErr) {
+		detail := strings.ToLower(upstreamErr.Code + " " + upstreamErr.Message + " " + upstreamErr.Body)
+		for _, marker := range []string{
+			"insufficient balance", "add funds", "insufficient credit",
+			"subscription required", "requires an active paid subscription",
+		} {
+			if strings.Contains(detail, marker) {
+				return accountFailureRemove, 0
+			}
+		}
+		switch upstreamErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return accountFailureCooldown, time.Hour
+		case http.StatusPaymentRequired:
+			return accountFailureRemove, 0
+		case http.StatusTooManyRequests:
+			return accountFailureCooldown, 2 * time.Minute
+		}
+		if isTransientUpstreamDetail(detail) {
+			return accountFailureCooldown, 30 * time.Second
+		}
 		return accountFailureNone, 0
 	}
 
-	switch upstreamErr.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return accountFailureCooldown, time.Hour
-	case http.StatusPaymentRequired:
-		return accountFailureRemove, 0
-	case http.StatusTooManyRequests:
-		return accountFailureCooldown, 2 * time.Minute
-	}
-
-	detail := strings.ToLower(upstreamErr.Message + " " + upstreamErr.Body)
-	for _, marker := range []string{
-		"insufficient balance", "add funds", "insufficient credit",
-		"subscription required",
-	} {
-		if strings.Contains(detail, marker) {
-			return accountFailureRemove, 0
-		}
+	if isTransientUpstreamDetail(strings.ToLower(err.Error())) {
+		return accountFailureCooldown, 30 * time.Second
 	}
 	return accountFailureNone, 0
+}
+
+func isTransientUpstreamDetail(detail string) bool {
+	for _, marker := range []string{
+		"upstream_http2_stream_error",
+		"http/2 stream error",
+		"http/2 stream failed",
+		"http2 stream failed",
+		"http2: server sent goaway",
+		"stream error:",
+		"stream id",
+		"received from peer",
+	} {
+		if strings.Contains(detail, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) resolveModel(requested string) string {
@@ -719,8 +827,10 @@ func finalAssistant(ctx context.Context, cli *upstream.Client, todoID, fallback 
 		}
 		if fallback != "" {
 			result.Content = fallback
-			return result, nil
 		}
+		// The newest assistant message is authoritative. Do not fall back to an
+		// older assistant turn when this run completed without a body.
+		return result, nil
 	}
 	return assistantResult{Content: fallback}, nil
 }
