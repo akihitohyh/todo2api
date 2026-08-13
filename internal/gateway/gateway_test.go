@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -496,12 +497,38 @@ func TestAccountFailurePolicy(t *testing.T) {
 			action: accountFailureRemove,
 		},
 		{
+			name: "paid subscription required in 403 body",
+			err: &upstream.HTTPError{
+				StatusCode: http.StatusForbidden,
+				Message:    "The LLM API requires an active paid subscription.",
+			},
+			action: accountFailureRemove,
+		},
+		{
 			name: "rate limit", err: &upstream.HTTPError{StatusCode: http.StatusTooManyRequests},
 			action: accountFailureCooldown, min: time.Minute,
 		},
 		{
 			name: "generic upstream failure",
 			err:  &upstream.HTTPError{StatusCode: http.StatusInternalServerError, Message: "internal error"},
+		},
+		{
+			name:   "http2 stream error",
+			err:    errors.New("upstream HTTP/2 stream failed: stream error: stream ID 3; INTERNAL_ERROR; received from peer"),
+			action: accountFailureCooldown, min: 20 * time.Second,
+		},
+		{
+			name: "http2 upstream code",
+			err: &upstream.HTTPError{
+				StatusCode: http.StatusBadGateway, Code: "upstream_http2_stream_error",
+				Message: "Upstream HTTP/2 stream failed",
+			},
+			action: accountFailureCooldown, min: 20 * time.Second,
+		},
+		{
+			name:   "empty completion",
+			err:    fmt.Errorf("fallback exhausted: %w", ErrEmptyCompletion),
+			action: accountFailureCooldown, min: 20 * time.Second,
 		},
 		{name: "network error", err: errors.New("connection reset")},
 	}
@@ -513,6 +540,16 @@ func TestAccountFailurePolicy(t *testing.T) {
 				t.Fatalf("action = %d, cooldown = %s", action, duration)
 			}
 		})
+	}
+}
+
+func TestEmptyCompletionErrorIsStable(t *testing.T) {
+	err := fmt.Errorf("%w; no fallback account was available", ErrEmptyCompletion)
+	if !errors.Is(err, ErrEmptyCompletion) {
+		t.Fatalf("errors.Is(%v, ErrEmptyCompletion) = false", err)
+	}
+	if got := err.Error(); got != "Upstream returned an empty completion without usage; no fallback account was available" {
+		t.Fatalf("error = %q", got)
 	}
 }
 

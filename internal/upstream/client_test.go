@@ -36,6 +36,23 @@ func TestHTTPErrorPreservesUpstreamDetails(t *testing.T) {
 	}
 }
 
+func TestHTTPErrorPreservesNestedDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":{"message":"Upstream HTTP/2 stream failed","code":"upstream_http2_stream_error"}}`)
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, "key").CreateTodo(context.Background(), "project-1", "hello", AgentSettings{})
+	var upstreamErr *HTTPError
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("error = %T %v, want *HTTPError", err, err)
+	}
+	if upstreamErr.Code != "upstream_http2_stream_error" || upstreamErr.Message != "Upstream HTTP/2 stream failed" {
+		t.Fatalf("nested HTTP error = %#v", upstreamErr)
+	}
+}
+
 func TestCreateAndAddMessageWireFormat(t *testing.T) {
 	var createBody, addBody map[string]any
 	var todoPostCount int

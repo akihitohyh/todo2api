@@ -34,13 +34,28 @@ type errorResponse struct {
 	Code    string `json:"code"`
 }
 
+type errorEnvelope struct {
+	Message string         `json:"message"`
+	Code    string         `json:"code"`
+	Error   *errorResponse `json:"error"`
+}
+
 func newHTTPError(method, path string, statusCode int, data []byte) *HTTPError {
 	body := strings.TrimSpace(string(data))
-	var response errorResponse
+	var response errorEnvelope
 	_ = json.Unmarshal(data, &response)
+	message, code := response.Message, response.Code
+	if response.Error != nil {
+		if response.Error.Message != "" {
+			message = response.Error.Message
+		}
+		if response.Error.Code != "" {
+			code = response.Error.Code
+		}
+	}
 	return &HTTPError{
 		Method: method, Path: path, StatusCode: statusCode,
-		Message: response.Message, Code: response.Code, Body: body,
+		Message: message, Code: code, Body: body,
 	}
 }
 
