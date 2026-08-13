@@ -197,13 +197,16 @@ type mockUpstream struct {
 	beforeReady       chan struct{}
 	createFailures    map[string]bool
 	createAttempts    map[string]int
+	dropWSEvents      bool
+	restTodoStatus    string
+	silentKeys        map[string]bool
 }
 
 func newMockUpstream(t *testing.T) *mockUpstream {
 	t.Helper()
 	m := &mockUpstream{
 		t: t, sockets: map[string]*websocket.Conn{},
-		createFailures: map[string]bool{}, createAttempts: map[string]int{},
+		createFailures: map[string]bool{}, createAttempts: map[string]int{}, silentKeys: map[string]bool{},
 	}
 	upgrader := websocket.Upgrader{
 		CheckOrigin:  func(*http.Request) bool { return true },
@@ -319,6 +322,19 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 			"hasMore": false,
 		})
 	})
+	mux.HandleFunc("/api/v1/todos/todo-1", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		status := m.restTodoStatus
+		silent := m.silentKeys[r.Header.Get("X-API-Key")]
+		m.mu.Unlock()
+		if silent {
+			status = "RUNNING"
+		}
+		if status == "" {
+			status = "RUNNING"
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": "todo-1", "status": status})
+	})
 	mux.HandleFunc("/api/v1/todos/todo-1/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		tabID := r.Header.Get("X-Tab-ID")
 		m.mu.Lock()
@@ -328,7 +344,11 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 		fragments := append([]string(nil), m.streamFragments...)
 		delay := m.streamDelay
 		beforeReady := m.beforeReady
-		if len(fragments) > 0 {
+		dropWSEvents := m.dropWSEvents
+		silent := m.silentKeys[r.Header.Get("X-API-Key")]
+		if dropWSEvents {
+			content = m.assistantContent
+		} else if len(fragments) > 0 {
 			content = strings.Join(fragments, "")
 			m.assistantContent = content
 		} else {
@@ -351,6 +371,9 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"id": "todo-1", "status": "RUNNING"})
+		if dropWSEvents || silent {
+			return
+		}
 		go func() {
 			if len(fragments) > 0 {
 				for _, fragment := range fragments {
@@ -423,6 +446,70 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 		m.server.Close()
 	})
 	return m
+}
+
+func TestCompleteRecoversMissedWebSocketCompletionViaREST(t *testing.T) {
+	mock := newMockUpstream(t)
+	mock.mu.Lock()
+	mock.dropWSEvents = true
+	mock.restTodoStatus = "READY"
+	mock.assistantContent = "REST recovered reply"
+	mock.mu.Unlock()
+
+	gw := newTestGateway(t, mock)
+	started := time.Now()
+	reply, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model: "public-model", Messages: []openai.ChatMessage{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Content != "REST recovered reply" || time.Since(started) > time.Second {
+		t.Fatalf("reply = %#v, elapsed = %s", reply, time.Since(started))
+	}
+}
+
+func TestStreamFailsOverBeforeStartingClientStream(t *testing.T) {
+	mock := newMockUpstream(t)
+	mock.mu.Lock()
+	mock.silentKeys["bad-key"] = true
+	mock.streamFragments = []string{"OK"}
+	mock.mu.Unlock()
+
+	cfg := &config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: mock.server.URL + "/api/v1", PollTimeout: 3 * time.Second},
+		Pool: config.PoolConfig{Strategy: "round_robin", Keys: []config.AccountKey{
+			{APIKey: "bad-key", ProjectID: "project-1"},
+			{APIKey: "good-key", ProjectID: "project-1"},
+		}},
+		Models: config.ModelsConfig{Default: "openai:vendor/upstream-model", Aliases: map[string]string{
+			"public-model": "openai:vendor/upstream-model",
+		}},
+	}
+	p, err := pool.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := New(cfg, p, session.New())
+	var events []StreamEvent
+	reply, err := gw.Stream(context.Background(), openai.ChatRequest{
+		Model: "public-model", Messages: []openai.ChatMessage{{Role: "user", Content: "hello"}},
+	}, func(event StreamEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Content != "OK" || len(events) != 2 || events[0].Type != StreamStart || events[1].Delta != "OK" {
+		t.Fatalf("reply=%#v events=%#v", reply, events)
+	}
+	mock.mu.Lock()
+	badAttempts, goodAttempts := mock.createAttempts["bad-key"], mock.createAttempts["good-key"]
+	mock.mu.Unlock()
+	if badAttempts != 1 || goodAttempts != 1 {
+		t.Fatalf("create attempts: bad=%d good=%d", badAttempts, goodAttempts)
+	}
 }
 
 func TestNewConversationFailsOverFromInsufficientBalance(t *testing.T) {
@@ -529,6 +616,11 @@ func TestAccountFailurePolicy(t *testing.T) {
 			name:   "empty completion",
 			err:    fmt.Errorf("fallback exhausted: %w", ErrEmptyCompletion),
 			action: accountFailureCooldown, min: 20 * time.Second,
+		},
+		{
+			name:   "first response timeout",
+			err:    fmt.Errorf("account stalled: %w", ErrFirstResponseTimeout),
+			action: accountFailureCooldown, min: 5 * time.Minute,
 		},
 		{name: "network error", err: errors.New("connection reset")},
 	}

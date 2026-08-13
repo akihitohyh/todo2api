@@ -263,8 +263,11 @@ func parseBulkKeys(input string) []string {
 }
 
 func (s *Service) Run(ctx context.Context) {
-	_ = s.startAutomaticRefreshAll()
-	ticker := time.NewTicker(5 * time.Minute)
+	// Health state is persisted, and newly imported keys are refreshed by their
+	// add handlers. Avoid scanning every account immediately after warmup: for a
+	// large pool that creates continuous upstream traffic precisely when the
+	// gateway starts serving requests.
+	ticker := time.NewTicker(30 * time.Minute)
 	cleanup := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	defer cleanup.Stop()
@@ -721,20 +724,20 @@ func (s *Service) refreshOne(ctx context.Context, id int64) (storage.Account, er
 			_ = s.pool.SetEnabledReason(ctx, id, false, "exhausted")
 		}
 	} else if current.Enabled {
-		if account := s.pool.AccountByID(id); account != nil {
-			account.ClearCooldown()
-		}
-		if err := s.pool.Refresh(ctx, id); err != nil {
-			if errors.Is(err, pool.ErrInitializationInProgress) {
+		account := s.pool.AccountByID(id)
+		if account != nil && !account.Initialized() {
+			if err := s.pool.Refresh(ctx, id); err != nil {
+				if errors.Is(err, pool.ErrInitializationInProgress) {
+					s.hub.publish("accounts")
+					s.hub.publish("stats")
+					return s.store.Account(ctx, id)
+				}
+				_ = s.store.SetHealthError(ctx, id, "error", err.Error())
 				s.hub.publish("accounts")
 				s.hub.publish("stats")
-				return s.store.Account(ctx, id)
+				updated, _ := s.store.Account(ctx, id)
+				return updated, err
 			}
-			_ = s.store.SetHealthError(ctx, id, "error", err.Error())
-			s.hub.publish("accounts")
-			s.hub.publish("stats")
-			updated, _ := s.store.Account(ctx, id)
-			return updated, err
 		}
 	}
 	s.hub.publish("accounts")

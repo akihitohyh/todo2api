@@ -142,6 +142,9 @@ func (a *Account) Removed() bool { return a.removed.Load() }
 // APIKey returns the upstream API key for this account.
 func (a *Account) APIKey() string { return a.keySnapshot().APIKey }
 
+// Initialized reports whether project and agent settings have been loaded.
+func (a *Account) Initialized() bool { return a.initialized.Load() }
+
 func (a *Account) claimInit() bool {
 	if a.initialized.Load() || a.removed.Load() || a.disabled.Load() {
 		return false
@@ -873,6 +876,7 @@ func (p *Pool) SetEnabledReason(ctx context.Context, id int64, enabled bool, rea
 	}
 	account.disabled.Store(false)
 	account.removed.Store(false)
+	account.ClearCooldown()
 	p.addReady(account)
 	return nil
 }

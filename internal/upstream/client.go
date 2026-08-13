@@ -253,24 +253,28 @@ type modelListResp struct {
 	Data   []ModelInfo `json:"data"`
 }
 
-func New(baseURL, apiKey string) *Client {
-	transport := &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		MaxConnsPerHost:       50,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    false,
-		ForceAttemptHTTP2:     true,
-	}
+// All account clients target the same upstream host. Sharing one transport
+// keeps connection limits meaningful when the pool contains thousands of
+// keys; one transport per key otherwise multiplies these limits by the number
+// of accounts and leaves a large number of idle upstream connections open.
+var sharedHTTPTransport = &http.Transport{
+	MaxIdleConns:          64,
+	MaxIdleConnsPerHost:   32,
+	MaxConnsPerHost:       64,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	DisableCompression:    false,
+	ForceAttemptHTTP2:     true,
+}
 
+func New(baseURL, apiKey string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
 		http: &http.Client{
 			Timeout:   30 * time.Second,
-			Transport: transport,
+			Transport: sharedHTTPTransport,
 		},
 	}
 }
@@ -428,6 +432,17 @@ func (c *Client) Messages(ctx context.Context, todoID string) ([]Message, error)
 		return nil, err
 	}
 	return resp.Messages, nil
+}
+
+// GetTodo returns the current run status. It is used as a REST fallback when
+// the frontend WebSocket misses a terminal todo:status event.
+func (c *Client) GetTodo(ctx context.Context, todoID string) (*Todo, error) {
+	var todo Todo
+	path := fmt.Sprintf("/todos/%s", url.PathEscape(todoID))
+	if err := c.do(ctx, http.MethodGet, path, nil, &todo); err != nil {
+		return nil, err
+	}
+	return &todo, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {

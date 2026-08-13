@@ -34,6 +34,10 @@ type CallRecorder interface {
 
 var ErrAccountsUnavailable = errors.New("all upstream accounts are unavailable")
 
+// ErrFirstResponseTimeout means an account accepted a todo but produced no
+// model output promptly enough to keep the request assigned to that account.
+var ErrFirstResponseTimeout = errors.New("upstream account produced no response")
+
 // ErrEmptyCompletion means the upstream reported a completed run but did not
 // expose either assistant text or authoritative usage metadata. Treating this
 // as success makes clients observe an empty answer (and usage=0), so new
@@ -193,6 +197,7 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 	var sub *upstream.Subscription
 	var runtime pool.AccountRuntime
 	todoID := entry.TodoID
+	previousAssistantSignature := ""
 	var result assistantResult
 	var err error
 	if resuming {
@@ -216,6 +221,10 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 		if content == "" {
 			return nil, fmt.Errorf("resumed request has no new user or tool-result messages")
 		}
+		previousAssistantSignature, err = latestAssistantSignature(runCtx, runtime.Client, todoID)
+		if err != nil {
+			return nil, fmt.Errorf("read current assistant turn: %w", err)
+		}
 		attachments, err := registerAttachments(runCtx, runtime.Client, req.Attachments, todoID)
 		if err != nil {
 			return nil, err
@@ -237,7 +246,7 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 				return emit(StreamEvent{Type: StreamTextDelta, Model: publicModel, TodoID: todoID, Delta: delta})
 			}
 		}
-		result, err = g.waitAssistant(runCtx, sub, runtime.Client, todoID, emitText)
+		result, err = g.waitAssistant(runCtx, sub, runtime.Client, todoID, previousAssistantSignature, emitText)
 		if err == nil && result.Content == "" && !result.Usage.Available {
 			err = ErrEmptyCompletion
 		}
@@ -260,40 +269,50 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 				return nil, fmt.Errorf("upstream returned an empty todo id")
 			}
 
-			if emit != nil {
-				if err := emit(StreamEvent{Type: StreamStart, Model: publicModel, TodoID: todoID}); err != nil {
-					sub.Close()
-					acc.Release()
-					return nil, fmt.Errorf("emit stream start: %w", err)
+			streamStarted := false
+			startStream := func() error {
+				if emit == nil || streamStarted {
+					return nil
 				}
+				if err := emit(StreamEvent{Type: StreamStart, Model: publicModel, TodoID: todoID}); err != nil {
+					return fmt.Errorf("emit stream start: %w", err)
+				}
+				streamStarted = true
+				return nil
 			}
-
 			var emitText func(string) error
 			if emit != nil {
 				emitText = func(delta string) error {
+					if err := startStream(); err != nil {
+						return err
+					}
 					return emit(StreamEvent{
 						Type: StreamTextDelta, Model: publicModel, TodoID: todoID, Delta: delta,
 					})
 				}
 			}
-			result, err = g.waitAssistant(runCtx, sub, runtime.Client, todoID, emitText)
+			result, err = g.waitAssistant(runCtx, sub, runtime.Client, todoID, "", emitText)
 			empty := err == nil && result.Content == "" && !result.Usage.Available
 			if err == nil && !empty {
+				if err := startStream(); err != nil {
+					sub.Close()
+					acc.Release()
+					return nil, err
+				}
 				defer acc.Release()
 				defer sub.Close()
 				break
 			}
 
-			// A streaming response has already sent its start (and possibly text),
-			// so retrying it would duplicate protocol output. Non-streaming new
-			// conversations can safely be recreated on another account.
+			// Once visible stream bytes have been emitted, retrying would duplicate
+			// protocol output. Before that point both response modes can fail over.
 			failure := err
 			if empty {
 				failure = ErrEmptyCompletion
 			}
 			sub.Close()
 			acc.Release()
-			if emit != nil {
+			if streamStarted {
 				if handleErr := g.handleAccountFailure(acc, failure); handleErr != nil {
 					return nil, handleErr
 				}
@@ -495,11 +514,14 @@ const (
 )
 
 func accountFailurePolicy(err error) (accountFailureAction, time.Duration) {
+	if errors.Is(err, ErrFirstResponseTimeout) {
+		return accountFailureCooldown, 10 * time.Minute
+	}
 	if errors.Is(err, ErrEmptyCompletion) {
 		// A completed run with no body is usually a transient upstream/account
-		// failure. Give this key a short cooldown and let a new conversation
-		// try another account.
-		return accountFailureCooldown, 30 * time.Second
+		// failure. Keep it out of rotation long enough that a large pool does
+		// not continuously recycle the same bad accounts.
+		return accountFailureCooldown, 10 * time.Minute
 	}
 
 	var upstreamErr *upstream.HTTPError
@@ -680,6 +702,7 @@ func (g *Gateway) waitAssistant(
 	sub *upstream.Subscription,
 	cli *upstream.Client,
 	todoID string,
+	previousAssistantSignature string,
 	emit func(string) error,
 ) (assistantResult, error) {
 	events := make(chan upstream.Event, 32)
@@ -689,6 +712,10 @@ func (g *Gateway) waitAssistant(
 	var buf strings.Builder
 	var filter openai.ToolCallStreamFilter
 	pendingBlocks := make(map[string]struct{})
+	firstResponseTimer := time.NewTimer(g.firstResponseTimeout())
+	restTicker := time.NewTicker(g.restPollInterval())
+	defer firstResponseTimer.Stop()
+	defer restTicker.Stop()
 	for {
 		select {
 		case ev := <-events:
@@ -706,6 +733,9 @@ func (g *Gateway) waitAssistant(
 			switch ev.Type {
 			case "block:message":
 				buf.WriteString(payload.Content)
+				if payload.Content != "" {
+					stopTimer(firstResponseTimer)
+				}
 				if emit != nil {
 					if delta := filter.Push(payload.Content); delta != "" {
 						if err := emit(delta); err != nil {
@@ -729,7 +759,7 @@ func (g *Gateway) waitAssistant(
 					if len(pendingBlocks) > 0 && payload.Status != "DONE" {
 						continue
 					}
-					return finishAssistant(ctx, cli, todoID, buf.String(), &filter, emit)
+					return finishAssistant(ctx, cli, todoID, previousAssistantSignature, buf.String(), &filter, emit)
 				case "CANCELLED", "CANCELLED_CHECKED", "ERROR", "ERROR_CHECKED":
 					return assistantResult{}, fmt.Errorf("upstream todo %s ended with status %s", todoID, payload.Status)
 				}
@@ -738,7 +768,7 @@ func (g *Gateway) waitAssistant(
 			if ctx.Err() != nil {
 				return assistantResult{}, assistantWaitError(ctx)
 			}
-			result, restErr := finishAssistant(ctx, cli, todoID, buf.String(), &filter, emit)
+			result, restErr := finishAssistant(ctx, cli, todoID, previousAssistantSignature, buf.String(), &filter, emit)
 			if restErr != nil {
 				return assistantResult{}, restErr
 			}
@@ -746,10 +776,66 @@ func (g *Gateway) waitAssistant(
 				return assistantResult{}, err
 			}
 			return result, nil
+		case <-restTicker.C:
+			status, restErr := todoStatus(ctx, cli, todoID)
+			if restErr != nil {
+				continue
+			}
+			switch status {
+			case "READY", "READY_CHECKED", "DONE":
+				if len(pendingBlocks) > 0 && status != "DONE" {
+					continue
+				}
+				return finishAssistant(ctx, cli, todoID, previousAssistantSignature, buf.String(), &filter, emit)
+			case "CANCELLED", "CANCELLED_CHECKED", "ERROR", "ERROR_CHECKED":
+				return assistantResult{}, fmt.Errorf("upstream todo %s ended with status %s", todoID, status)
+			}
+		case <-firstResponseTimer.C:
+			if buf.Len() == 0 {
+				return assistantResult{}, fmt.Errorf("%w after %s", ErrFirstResponseTimeout, g.firstResponseTimeout())
+			}
 		case <-ctx.Done():
 			return assistantResult{}, assistantWaitError(ctx)
 		}
 	}
+}
+
+func (g *Gateway) firstResponseTimeout() time.Duration {
+	timeout := g.cfg.Upstream.PollTimeout / 6
+	if timeout > 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	if timeout < 500*time.Millisecond {
+		timeout = 500 * time.Millisecond
+	}
+	return timeout
+}
+
+func (g *Gateway) restPollInterval() time.Duration {
+	interval := g.firstResponseTimeout() / 5
+	if interval > 2*time.Second {
+		interval = 2 * time.Second
+	}
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	return interval
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer != nil {
+		timer.Stop()
+	}
+}
+
+func todoStatus(ctx context.Context, cli *upstream.Client, todoID string) (string, error) {
+	pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	todo, err := cli.GetTodo(pollCtx, todoID)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToUpper(todo.Status), nil
 }
 
 type assistantResult struct {
@@ -761,11 +847,12 @@ func finishAssistant(
 	ctx context.Context,
 	cli *upstream.Client,
 	todoID string,
+	previousAssistantSignature string,
 	streamed string,
 	filter *openai.ToolCallStreamFilter,
 	emit func(string) error,
 ) (assistantResult, error) {
-	result, err := finalAssistant(ctx, cli, todoID, streamed)
+	result, err := finalAssistant(ctx, cli, todoID, previousAssistantSignature, streamed)
 	if err != nil {
 		return assistantResult{}, err
 	}
@@ -798,7 +885,20 @@ func assistantWaitError(ctx context.Context) error {
 	return fmt.Errorf("waiting for assistant reply: %w", ctx.Err())
 }
 
-func finalAssistant(ctx context.Context, cli *upstream.Client, todoID, fallback string) (assistantResult, error) {
+func latestAssistantSignature(ctx context.Context, cli *upstream.Client, todoID string) (string, error) {
+	msgs, err := cli.Messages(ctx, todoID)
+	if err != nil {
+		return "", err
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			return assistantMessageSignature(msgs[i]), nil
+		}
+	}
+	return "", nil
+}
+
+func finalAssistant(ctx context.Context, cli *upstream.Client, todoID, previousAssistantSignature, fallback string) (assistantResult, error) {
 	msgs, err := cli.Messages(ctx, todoID)
 	if err != nil {
 		if fallback != "" {
@@ -809,6 +909,9 @@ func finalAssistant(ctx context.Context, cli *upstream.Client, todoID, fallback 
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role != "assistant" {
 			continue
+		}
+		if previousAssistantSignature != "" && assistantMessageSignature(msgs[i]) == previousAssistantSignature {
+			return assistantResult{Content: fallback}, nil
 		}
 		result := assistantResult{Usage: tokenUsage(msgs[i].RunMeta)}
 		if msgs[i].Content != "" {
@@ -833,6 +936,12 @@ func finalAssistant(ctx context.Context, cli *upstream.Client, todoID, fallback 
 		return result, nil
 	}
 	return assistantResult{Content: fallback}, nil
+}
+
+func assistantMessageSignature(message upstream.Message) string {
+	data, _ := json.Marshal(message)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func tokenUsage(meta []upstream.RunMeta) TokenUsage {
