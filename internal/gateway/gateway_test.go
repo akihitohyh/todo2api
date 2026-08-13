@@ -622,6 +622,11 @@ func TestAccountFailurePolicy(t *testing.T) {
 			err:    fmt.Errorf("account stalled: %w", ErrFirstResponseTimeout),
 			action: accountFailureCooldown, min: 5 * time.Minute,
 		},
+		{
+			name:   "upstream run error",
+			err:    fmt.Errorf("todo failed: %w", ErrUpstreamRunFailed),
+			action: accountFailureCooldown, min: time.Minute,
+		},
 		{name: "network error", err: errors.New("connection reset")},
 	}
 

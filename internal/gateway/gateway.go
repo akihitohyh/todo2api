@@ -38,6 +38,12 @@ var ErrAccountsUnavailable = errors.New("all upstream accounts are unavailable")
 // model output promptly enough to keep the request assigned to that account.
 var ErrFirstResponseTimeout = errors.New("upstream account produced no response")
 
+// ErrUpstreamRunFailed means the upstream accepted a todo but terminated the
+// model run with an error status before producing a usable completion. This is
+// commonly account/provider-specific, so new conversations may retry another
+// pooled account while preserving the original error if no fallback exists.
+var ErrUpstreamRunFailed = errors.New("upstream todo run failed")
+
 // ErrEmptyCompletion means the upstream reported a completed run but did not
 // expose either assistant text or authoritative usage metadata. Treating this
 // as success makes clients observe an empty answer (and usage=0), so new
@@ -517,6 +523,9 @@ func accountFailurePolicy(err error) (accountFailureAction, time.Duration) {
 	if errors.Is(err, ErrFirstResponseTimeout) {
 		return accountFailureCooldown, 10 * time.Minute
 	}
+	if errors.Is(err, ErrUpstreamRunFailed) {
+		return accountFailureCooldown, 2 * time.Minute
+	}
 	if errors.Is(err, ErrEmptyCompletion) {
 		// A completed run with no body is usually a transient upstream/account
 		// failure. Keep it out of rotation long enough that a large pool does
@@ -761,7 +770,7 @@ func (g *Gateway) waitAssistant(
 					}
 					return finishAssistant(ctx, cli, todoID, previousAssistantSignature, buf.String(), &filter, emit)
 				case "CANCELLED", "CANCELLED_CHECKED", "ERROR", "ERROR_CHECKED":
-					return assistantResult{}, fmt.Errorf("upstream todo %s ended with status %s", todoID, payload.Status)
+					return assistantResult{}, fmt.Errorf("%w: todo %s ended with status %s", ErrUpstreamRunFailed, todoID, payload.Status)
 				}
 			}
 		case err := <-errc:
@@ -788,7 +797,7 @@ func (g *Gateway) waitAssistant(
 				}
 				return finishAssistant(ctx, cli, todoID, previousAssistantSignature, buf.String(), &filter, emit)
 			case "CANCELLED", "CANCELLED_CHECKED", "ERROR", "ERROR_CHECKED":
-				return assistantResult{}, fmt.Errorf("upstream todo %s ended with status %s", todoID, status)
+				return assistantResult{}, fmt.Errorf("%w: todo %s ended with status %s", ErrUpstreamRunFailed, todoID, status)
 			}
 		case <-firstResponseTimer.C:
 			if buf.Len() == 0 {
