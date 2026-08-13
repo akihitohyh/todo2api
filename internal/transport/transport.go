@@ -28,6 +28,11 @@ func New(cfg *config.Config, gw *gateway.Gateway) *Server {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	s.Register(mux)
+	return mux
+}
+
+func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -39,20 +44,28 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/messeges/count_tokens", s.auth(s.handleMessagesCountTokens))
 	mux.HandleFunc("/v1/messeges", s.auth(s.handleMessages))
 	mux.HandleFunc("/v1/responses", s.auth(s.handleResponses))
-	return mux
 }
 
 // auth accepts OpenAI bearer tokens and Anthropic x-api-key tokens.
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
-	tokens := map[string]bool{}
+	tokens := map[string]struct{}{}
+	configured := len(s.cfg.Server.ClientTokens) > 0
 	for _, t := range s.cfg.Server.ClientTokens {
-		tokens[t] = true
+		if t = strings.TrimSpace(t); t != "" {
+			tokens[t] = struct{}{}
+		}
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		if len(tokens) > 0 {
-			bearer := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if configured {
+			var bearer string
+			scheme, credential, found := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
+			if found && strings.EqualFold(scheme, "Bearer") {
+				bearer = strings.TrimSpace(credential)
+			}
 			xAPIKey := strings.TrimSpace(r.Header.Get("X-API-Key"))
-			if !tokens[bearer] && !tokens[xAPIKey] {
+			_, bearerOK := tokens[bearer]
+			_, apiKeyOK := tokens[xAPIKey]
+			if bearer == "" && xAPIKey == "" || !bearerOK && !apiKeyOK {
 				if strings.HasPrefix(r.URL.Path, "/v1/messages") || strings.HasPrefix(r.URL.Path, "/v1/messeges") {
 					writeAnthropicErr(w, http.StatusUnauthorized, "authentication_error", "invalid api key")
 				} else {

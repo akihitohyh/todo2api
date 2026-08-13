@@ -21,6 +21,9 @@ coverage.out
 *.log
 
 api_keys.txt
+*.db
+*.db-shm
+*.db-wal
 *.exe
 build/
 build.bat

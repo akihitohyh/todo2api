@@ -1,0 +1,65 @@
+@import 'lxgw-wenkai-screen-webfont/style.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Warm parchment light theme — from DESIGN.md */
+    --background: 53 29% 94%;
+    --foreground: 50 4% 8%;
+    --card: 45 33% 96%;
+    --card-foreground: 50 4% 8%;
+    --popover: 45 33% 96%;
+    --popover-foreground: 50 4% 8%;
+    --primary: 15 52% 52%;
+    --primary-foreground: 45 33% 96%;
+    --secondary: 45 17% 86%;
+    --secondary-foreground: 44 4% 29%;
+    --muted: 45 17% 86%;
+    --muted-foreground: 40 4% 51%;
+    --accent: 45 17% 86%;
+    --accent-foreground: 44 4% 29%;
+    --destructive: 0 60% 45%;
+    --destructive-foreground: 45 33% 96%;
+    --border: 45 21% 91%;
+    --input: 45 21% 91%;
+    --ring: 210 82% 58%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    /* Warm dark theme */
+    --background: 50 4% 8%;
+    --foreground: 45 33% 96%;
+    --card: 42 4% 18%;
+    --card-foreground: 45 33% 96%;
+    --popover: 42 4% 18%;
+    --popover-foreground: 45 33% 96%;
+    --primary: 15 52% 52%;
+    --primary-foreground: 45 33% 96%;
+    --secondary: 42 4% 18%;
+    --secondary-foreground: 40 7% 67%;
+    --muted: 42 4% 18%;
+    --muted-foreground: 40 7% 67%;
+    --accent: 42 4% 22%;
+    --accent-foreground: 40 7% 67%;
+    --destructive: 0 60% 45%;
+    --destructive-foreground: 45 33% 96%;
+    --border: 42 4% 22%;
+    --input: 42 4% 22%;
+    --ring: 210 82% 58%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+  }
+}

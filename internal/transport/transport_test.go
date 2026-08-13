@@ -168,6 +168,42 @@ func TestGatewayUnavailableMapsToRetryable503(t *testing.T) {
 	}
 }
 
+func TestAuthNeverAcceptsEmptyConfiguredToken(t *testing.T) {
+	s := &Server{cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{""}}}}
+	called := false
+	handler := s.auth(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	recorder := httptest.NewRecorder()
+	handler(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusUnauthorized || called {
+		t.Fatalf("status=%d called=%v", recorder.Code, called)
+	}
+}
+
+func TestAuthRequiresBearerScheme(t *testing.T) {
+	s := &Server{cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-token"}}}}
+	handler := s.auth(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "client-token")
+	recorder := httptest.NewRecorder()
+	handler(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("bare authorization status=%d", recorder.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "bearer client-token")
+	recorder = httptest.NewRecorder()
+	handler(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("bearer authorization status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestModelsIncludesDefaultAndIsSorted(t *testing.T) {
 	s := &Server{cfg: &config.Config{Models: config.ModelsConfig{
 		Default: "model-default",

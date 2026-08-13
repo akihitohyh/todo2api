@@ -3,17 +3,34 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"todo2api/internal/config"
 	"todo2api/internal/upstream"
 )
+
+type testAccountRepository struct {
+	enabled     atomic.Bool
+	healthCalls atomic.Int64
+}
+
+func (r *testAccountRepository) SetEnabled(_ context.Context, _ int64, enabled bool, _ string) error {
+	r.enabled.Store(enabled)
+	return nil
+}
+func (*testAccountRepository) DeleteAccount(context.Context, int64) error { return nil }
+func (r *testAccountRepository) SetHealthError(context.Context, int64, string, string) error {
+	r.healthCalls.Add(1)
+	return nil
+}
 
 func TestRoundRobinAcrossAccounts(t *testing.T) {
 	first := &Account{ProjectID: "project-1"}
@@ -99,6 +116,49 @@ func TestLeastBusyRotatesEqualAccountsAndSkipsCooldown(t *testing.T) {
 func TestEmptyPoolReturnsNil(t *testing.T) {
 	if got := (&Pool{}).Pick(); got != nil {
 		t.Fatalf("empty pool pick = %p, want nil", got)
+	}
+}
+
+func TestRefreshReportsInitializationInProgress(t *testing.T) {
+	account := &Account{ID: 42}
+	account.initing.Store(true)
+	p := &Pool{configured: []*Account{account}}
+
+	err := p.Refresh(context.Background(), 42)
+	if !errors.Is(err, ErrInitializationInProgress) {
+		t.Fatalf("refresh error = %v, want ErrInitializationInProgress", err)
+	}
+}
+
+func TestDisabledAccountSkipsStartupAndFailedEnableStaysDisabled(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	repo := &testAccountRepository{}
+	p, err := New(&config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL, PollTimeout: 100 * time.Millisecond},
+		Pool: config.PoolConfig{Strategy: "round_robin", Keys: []config.AccountKey{
+			{ID: 1, APIKey: "disabled-key", Enabled: false},
+		}},
+		Models: config.ModelsConfig{Default: "openai:openai/test"},
+	}, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("disabled account made %d startup requests", got)
+	}
+	if err := p.SetEnabled(context.Background(), 1, true); err == nil {
+		t.Fatal("enabling an unusable account succeeded")
+	}
+	if repo.enabled.Load() {
+		t.Fatal("failed initialization persisted enabled=true")
+	}
+	if repo.healthCalls.Load() != 1 || p.Pick() != nil {
+		t.Fatalf("health calls=%d pick=%p", repo.healthCalls.Load(), p.Pick())
 	}
 }
 
@@ -482,5 +542,61 @@ func TestReloadKeysPreservesInlineOnlySet(t *testing.T) {
 	}
 	if stats.Removed != 1 || p.Len() != 1 || p.Configured() != 1 {
 		t.Fatalf("stats=%+v ready=%d configured=%d", stats, p.Len(), p.Configured())
+	}
+}
+
+func TestReloadKeysRotatesCredentialForStableDatabaseID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-Key")
+		switch r.URL.Path {
+		case "/api/v1/models":
+			json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{"id": "openai/test"}}})
+		case "/api/v1/projects":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "project-" + key}})
+		case "/api/v1/agents":
+			json.NewEncoder(w).Encode([]map[string]any{{"id": "agent-" + key}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		Upstream: config.UpstreamConfig{BaseURL: server.URL + "/api/v1", PollTimeout: time.Second},
+		Pool: config.PoolConfig{Strategy: "round_robin", Keys: []config.AccountKey{{
+			ID: 42, APIKey: "old-key", Enabled: true,
+		}}},
+		Models: config.ModelsConfig{Default: "openai:openai/test"},
+	}
+	p, err := New(cfg, &testAccountRepository{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := p.At(0)
+	if account == nil {
+		t.Fatal("account was not initialized")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 5000 {
+			_ = account.Runtime()
+			_ = account.APIKey()
+		}
+	}()
+	stats, err := p.ReloadKeys(context.Background(), []config.AccountKey{{
+		ID: 42, APIKey: "new-key", Enabled: true,
+	}})
+	<-done
+	if err != nil || stats.Failed != 0 {
+		t.Fatalf("stats=%+v err=%v", stats, err)
+	}
+	if got := p.AccountByID(42); got != account || p.At(0) != account {
+		t.Fatal("credential rotation changed the stable account slot")
+	}
+	runtime := account.Runtime()
+	if account.APIKey() != "new-key" || runtime.ProjectID != "project-new-key" {
+		t.Fatalf("key=%q project=%q", account.APIKey(), runtime.ProjectID)
 	}
 }

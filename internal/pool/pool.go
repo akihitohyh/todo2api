@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,20 +14,102 @@ import (
 	"todo2api/internal/upstream"
 )
 
+var ErrInitializationInProgress = errors.New("account initialization is already in progress")
+
 // Account is one pooled todofor.ai API key + its upstream client.
 type Account struct {
+	ID            int64
 	Client        *upstream.Client
 	ProjectID     string
 	Agent         upstream.AgentSettings
 	EdgeTools     upstream.FilteredEdgeTools // discovered once, forwarded per request
+	stateMu       sync.RWMutex
 	inflight      int64
 	cooldownUntil atomic.Int64
 	disabled      atomic.Bool // permanent removal (e.g. exhausted balance)
 	removed       atomic.Bool // soft-delete from key-file hot reload
 	initing       atomic.Bool
+	initialized   atomic.Bool
 	removeMu      sync.Mutex
 	key           config.AccountKey
 	ready         atomic.Bool
+}
+
+// AccountRuntime is an immutable per-request view of an account. Callers keep
+// this snapshot for the whole upstream operation so a concurrent reconcile can
+// atomically install new credentials without mixing old and new state.
+type AccountRuntime struct {
+	Client    *upstream.Client
+	ProjectID string
+	Agent     upstream.AgentSettings
+	EdgeTools upstream.FilteredEdgeTools
+}
+
+func newAccount(baseURL string, key config.AccountKey) *Account {
+	return &Account{
+		ID: key.ID, Client: upstream.New(baseURL, key.APIKey), key: key,
+	}
+}
+
+func (a *Account) Runtime() AccountRuntime {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return AccountRuntime{
+		Client: a.Client, ProjectID: a.ProjectID, Agent: a.Agent, EdgeTools: a.EdgeTools,
+	}
+}
+
+func (a *Account) DatabaseID() int64 {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.ID
+}
+
+func (a *Account) keySnapshot() config.AccountKey {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.key
+}
+
+func (a *Account) initializationSnapshot() (AccountRuntime, config.AccountKey) {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return AccountRuntime{
+		Client: a.Client, ProjectID: a.ProjectID, Agent: a.Agent, EdgeTools: a.EdgeTools,
+	}, a.key
+}
+
+func (a *Account) applyInitialization(expected config.AccountKey, projectID string, agent upstream.AgentSettings, edgeTools upstream.FilteredEdgeTools) bool {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	if a.key != expected {
+		return false
+	}
+	a.ProjectID = projectID
+	a.Agent = agent
+	a.EdgeTools = edgeTools
+	a.initialized.Store(true)
+	return true
+}
+
+func (a *Account) setKey(key config.AccountKey) {
+	a.stateMu.Lock()
+	a.ID = key.ID
+	a.key = key
+	a.stateMu.Unlock()
+}
+
+func (a *Account) installCandidate(candidate *Account, key config.AccountKey) {
+	runtime := candidate.Runtime()
+	a.stateMu.Lock()
+	a.ID = key.ID
+	a.Client = runtime.Client
+	a.ProjectID = runtime.ProjectID
+	a.Agent = runtime.Agent
+	a.EdgeTools = runtime.EdgeTools
+	a.key = key
+	a.stateMu.Unlock()
+	a.initialized.Store(candidate.initialized.Load())
 }
 
 func (a *Account) Acquire() { atomic.AddInt64(&a.inflight, 1) }
@@ -44,6 +127,9 @@ func (a *Account) CoolDown(duration time.Duration) {
 	}
 }
 
+// ClearCooldown restores new-traffic eligibility after a successful health check.
+func (a *Account) ClearCooldown() { a.cooldownUntil.Store(0) }
+
 func (a *Account) available(now int64) bool {
 	return !a.disabled.Load() && !a.removed.Load() && a.cooldownUntil.Load() <= now
 }
@@ -54,10 +140,10 @@ func (a *Account) available(now int64) bool {
 func (a *Account) Removed() bool { return a.removed.Load() }
 
 // APIKey returns the upstream API key for this account.
-func (a *Account) APIKey() string { return a.key.APIKey }
+func (a *Account) APIKey() string { return a.keySnapshot().APIKey }
 
 func (a *Account) claimInit() bool {
-	if a.ready.Load() || a.removed.Load() || a.disabled.Load() {
+	if a.initialized.Load() || a.removed.Load() || a.disabled.Load() {
 		return false
 	}
 	return a.initing.CompareAndSwap(false, true)
@@ -73,6 +159,7 @@ type Pool struct {
 	strategy      string
 	rr            uint64
 	mu            sync.Mutex // serializes Warm progress and ReloadKeys planning
+	reconcileMu   sync.Mutex
 	readyMu       sync.RWMutex
 	models        []upstream.ModelInfo
 	modelByID     map[string]upstream.ModelInfo
@@ -80,7 +167,20 @@ type Pool struct {
 	publicIDByID  map[string]string
 	warnings      []error
 	cfg           *config.Config
+	repo          AccountRepository
 	warmStart     int
+}
+
+func (p *Pool) SetRepository(repo AccountRepository) {
+	p.mu.Lock()
+	p.repo = repo
+	p.mu.Unlock()
+}
+
+type AccountRepository interface {
+	SetEnabled(context.Context, int64, bool, string) error
+	DeleteAccount(context.Context, int64) error
+	SetHealthError(context.Context, int64, string, string) error
 }
 
 // ReloadStats summarizes a key-set hot reload.
@@ -107,12 +207,27 @@ type accountInitResult struct {
 	err          error
 }
 
-func New(cfg *config.Config) (*Pool, error) {
+func New(cfg *config.Config, repositories ...AccountRepository) (*Pool, error) {
 	p := &Pool{strategy: cfg.Pool.Strategy, cfg: cfg}
+	if len(repositories) > 0 {
+		p.repo = repositories[0]
+	}
 	for _, key := range cfg.Pool.Keys {
-		p.configured = append(p.configured, &Account{
-			Client: upstream.New(cfg.Upstream.BaseURL, key.APIKey), key: key,
-		})
+		account := newAccount(cfg.Upstream.BaseURL, key)
+		if key.ID != 0 && !key.Enabled {
+			account.disabled.Store(true)
+		}
+		p.configured = append(p.configured, account)
+	}
+	activeConfigured := 0
+	for _, account := range p.configured {
+		if !account.disabled.Load() {
+			activeConfigured++
+		}
+	}
+	if activeConfigured == 0 {
+		p.setModels(nil)
+		return p, nil
 	}
 	var catalogs [][]upstream.ModelInfo
 	var firstAccountErr error
@@ -121,6 +236,9 @@ func New(cfg *config.Config) (*Pool, error) {
 		results := p.initializeBatch(context.Background(), p.warmStart, end, true, 1)
 		for offset, result := range results {
 			index := p.warmStart + offset
+			if result.account != nil && result.account.disabled.Load() {
+				continue
+			}
 			if result.err != nil {
 				if firstAccountErr == nil {
 					firstAccountErr = result.err
@@ -138,6 +256,10 @@ func New(cfg *config.Config) (*Pool, error) {
 		p.warmStart = end
 	}
 	if p.Len() == 0 {
+		if p.repo != nil {
+			p.setModels(nil)
+			return p, nil
+		}
 		if firstAccountErr != nil {
 			return nil, fmt.Errorf("no usable accounts out of %d configured: %w", len(p.configured), firstAccountErr)
 		}
@@ -158,8 +280,13 @@ func (p *Pool) initializeBatch(ctx context.Context, start, end int, discoverMode
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
+			account := p.configured[index]
+			if account.disabled.Load() {
+				results[index-start] = accountInitResult{account: account}
+				return
+			}
 			results[index-start] = initializeAccountWithRetry(
-				ctx, p.cfg, p.configured[index], discoverModels, attempts,
+				ctx, p.cfg, account, discoverModels, attempts,
 			)
 		}(index)
 	}
@@ -194,10 +321,14 @@ func initializeAccount(ctx context.Context, cfg *config.Config, account *Account
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	runtime, key := account.initializationSnapshot()
+	if runtime.Client == nil {
+		return accountInitResult{account: account, err: fmt.Errorf("account client is unavailable")}
+	}
 	var (
 		models       []upstream.ModelInfo
 		discoveryErr error
-		projectID    = account.key.ProjectID
+		projectID    = key.ProjectID
 		projectErr   error
 		agent        upstream.AgentSettings
 		agentErr     error
@@ -207,23 +338,23 @@ func initializeAccount(ctx context.Context, cfg *config.Config, account *Account
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			models, discoveryErr = account.Client.Models(ctx)
+			models, discoveryErr = runtime.Client.Models(ctx)
 		}()
 	}
 	if projectID == "" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			projectID, projectErr = account.Client.FirstProject(ctx)
+			projectID, projectErr = runtime.Client.FirstProject(ctx)
 		}()
 	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if account.key.AgentID == "" {
-			agent, agentErr = account.Client.FirstAgent(ctx)
+		if key.AgentID == "" {
+			agent, agentErr = runtime.Client.FirstAgent(ctx)
 		} else {
-			agent, agentErr = account.Client.Agent(ctx, account.key.AgentID)
+			agent, agentErr = runtime.Client.Agent(ctx, key.AgentID)
 		}
 	}()
 	wg.Wait()
@@ -238,20 +369,21 @@ func initializeAccount(ctx context.Context, cfg *config.Config, account *Account
 	if cfg.Edge.Enabled {
 		edgeID := cfg.Edge.ID()
 		if edgeID == "" {
-			id, err := account.Client.FirstOnlineEdge(ctx)
+			id, err := runtime.Client.FirstOnlineEdge(ctx)
 			if err != nil {
 				return accountInitResult{err: fmt.Errorf("find online edge: %w", err)}
 			}
 			edgeID = id
 		}
-		tools, err := account.Client.EdgeTools(ctx, edgeID, cfg.Edge.AllowTools)
+		tools, err := runtime.Client.EdgeTools(ctx, edgeID, cfg.Edge.AllowTools)
 		if err != nil {
 			return accountInitResult{err: fmt.Errorf("load edge tools: %w", err)}
 		}
-		account.EdgeTools = tools
+		runtime.EdgeTools = tools
 	}
-	account.ProjectID = projectID
-	account.Agent = agent
+	if !account.applyInitialization(key, projectID, agent, runtime.EdgeTools) {
+		return accountInitResult{account: account, err: fmt.Errorf("account configuration changed during initialization")}
+	}
 	return accountInitResult{account: account, models: models, discoveryErr: discoveryErr}
 }
 
@@ -362,20 +494,30 @@ func (p *Pool) Warm(ctx context.Context, onBatch func(ready, skipped, configured
 // indices are preserved: removed keys are soft-deleted (excluded from Pick),
 // and reappearing keys are restored in place when possible.
 func (p *Pool) ReloadKeys(ctx context.Context, keys []config.AccountKey) (ReloadStats, error) {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+
 	desired, desiredOrder := normalizeDesiredKeys(keys)
+	type changedAccount struct {
+		account *Account
+		key     config.AccountKey
+	}
 
 	p.mu.Lock()
 	byKey := make(map[string]*Account, len(p.configured))
 	activeKeys := make(map[string]struct{}, len(p.configured))
 	for _, account := range p.configured {
-		byKey[account.key.APIKey] = account
-		if !account.removed.Load() && !account.disabled.Load() {
-			activeKeys[account.key.APIKey] = struct{}{}
+		key := account.keySnapshot()
+		identity := keyIdentity(key)
+		byKey[identity] = account
+		if !account.removed.Load() {
+			activeKeys[identity] = struct{}{}
 		}
 	}
 
 	var stats ReloadStats
 	var needInit []*Account
+	var changed []changedAccount
 
 	for key := range activeKeys {
 		if _, ok := desired[key]; ok {
@@ -387,40 +529,78 @@ func (p *Pool) ReloadKeys(ctx context.Context, keys []config.AccountKey) (Reload
 	}
 
 	for _, key := range desiredOrder {
-		if account, ok := byKey[key.APIKey]; ok {
-			wasOut := account.removed.Load() || account.disabled.Load()
-			if wasOut {
+		identity := keyIdentity(key)
+		if account, ok := byKey[identity]; ok {
+			wasRemoved := account.removed.Load()
+			wasDisabled := account.disabled.Load()
+			oldKey := account.keySnapshot()
+			configurationChanged := oldKey.APIKey != key.APIKey || oldKey.ProjectID != key.ProjectID || oldKey.AgentID != key.AgentID
+			if configurationChanged {
+				// Stop new selection until a complete runtime can be installed.
+				account.removed.Store(true)
+				account.disabled.Store(key.ID != 0 && !key.Enabled)
+				changed = append(changed, changedAccount{account: account, key: key})
+			} else {
+				account.setKey(key)
 				account.removed.Store(false)
-				account.disabled.Store(false)
-				account.key = key
+				account.disabled.Store(key.ID != 0 && !key.Enabled)
+			}
+			if wasRemoved || (wasDisabled && key.Enabled) {
 				stats.Restored++
-				if !account.ready.Load() {
-					needInit = append(needInit, account)
-				}
+			}
+			if !configurationChanged && key.Enabled && !account.initialized.Load() {
+				needInit = append(needInit, account)
 			}
 			continue
 		}
-		account := &Account{
-			Client: upstream.New(p.cfg.Upstream.BaseURL, key.APIKey),
-			key:    key,
+		account := newAccount(p.cfg.Upstream.BaseURL, key)
+		if key.ID != 0 && !key.Enabled {
+			account.disabled.Store(true)
 		}
 		p.configured = append(p.configured, account)
-		byKey[key.APIKey] = account
+		byKey[identity] = account
 		stats.Added++
-		needInit = append(needInit, account)
+		if !account.disabled.Load() {
+			needInit = append(needInit, account)
+		}
 	}
 	stats.Configured = 0
-	for _, account := range p.configured {
-		if !account.disabled.Load() && !account.removed.Load() {
+	for _, key := range desiredOrder {
+		if key.ID == 0 || key.Enabled {
 			stats.Configured++
 		}
 	}
 	p.mu.Unlock()
 
+	for _, update := range changed {
+		update.account.removeMu.Lock()
+		candidate := newAccount(p.cfg.Upstream.BaseURL, update.key)
+		if update.key.ID != 0 && !update.key.Enabled {
+			candidate.disabled.Store(true)
+			update.account.installCandidate(candidate, update.key)
+			update.account.removed.Store(false)
+			update.account.removeMu.Unlock()
+			continue
+		}
+		result := initializeAccountWithRetry(ctx, p.cfg, candidate, false, maxWarmAttempts)
+		if result.err != nil {
+			update.account.installCandidate(candidate, update.key)
+			update.account.disabled.Store(true)
+			update.account.removeMu.Unlock()
+			stats.Failed++
+			continue
+		}
+		update.account.installCandidate(candidate, update.key)
+		update.account.disabled.Store(false)
+		update.account.removed.Store(false)
+		p.addReady(update.account)
+		update.account.removeMu.Unlock()
+	}
+
 	for i, account := range needInit {
 		if err := ctx.Err(); err != nil {
 			for _, remaining := range needInit[i:] {
-				if !remaining.ready.Load() && !remaining.removed.Load() && !remaining.disabled.Load() {
+				if !remaining.initialized.Load() && !remaining.removed.Load() && !remaining.disabled.Load() {
 					stats.Failed++
 				}
 			}
@@ -442,6 +622,13 @@ func (p *Pool) ReloadKeys(ctx context.Context, keys []config.AccountKey) (Reload
 	return stats, nil
 }
 
+func keyIdentity(key config.AccountKey) string {
+	if key.ID != 0 {
+		return fmt.Sprintf("id:%d", key.ID)
+	}
+	return "key:" + key.APIKey
+}
+
 func normalizeDesiredKeys(keys []config.AccountKey) (map[string]config.AccountKey, []config.AccountKey) {
 	desired := make(map[string]config.AccountKey, len(keys))
 	order := make([]config.AccountKey, 0, len(keys))
@@ -450,16 +637,18 @@ func normalizeDesiredKeys(keys []config.AccountKey) (map[string]config.AccountKe
 		if key.APIKey == "" {
 			continue
 		}
-		if _, exists := desired[key.APIKey]; exists {
+		identity := keyIdentity(key)
+		if _, exists := desired[identity]; exists {
 			continue
 		}
-		desired[key.APIKey] = key
+		desired[identity] = key
 		order = append(order, key)
 	}
 	return desired, order
 }
 
 func (p *Pool) addReady(account *Account) {
+	account.releaseInit()
 	if account.removed.Load() || account.disabled.Load() {
 		return
 	}
@@ -572,6 +761,17 @@ func (p *Pool) At(i int) *Account {
 	return account
 }
 
+func (p *Pool) AccountByID(id int64) *Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, account := range p.configured {
+		if account.DatabaseID() == id {
+			return account
+		}
+	}
+	return nil
+}
+
 func (p *Pool) IndexOf(a *Account) int {
 	p.readyMu.RLock()
 	defer p.readyMu.RUnlock()
@@ -587,6 +787,9 @@ func (p *Pool) IndexOf(a *Account) int {
 // permanently excludes it from new-conversation selection. The stable slot is
 // retained because active sessions persist account indexes.
 func (p *Pool) Remove(a *Account) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+
 	p.readyMu.RLock()
 	found := false
 	for _, account := range p.accounts {
@@ -606,15 +809,124 @@ func (p *Pool) Remove(a *Account) error {
 		return nil
 	}
 	a.disabled.Store(true)
-	if p.cfg == nil {
-		a.disabled.Store(false)
-		return fmt.Errorf("pool configuration is unavailable")
+	id := a.DatabaseID()
+	if p.repo == nil || id == 0 {
+		// Compatibility for in-memory pools used by tests and embedders.
+		keys := p.cfg.Pool.Keys[:0]
+		for _, key := range p.cfg.Pool.Keys {
+			if key.APIKey != a.APIKey() {
+				keys = append(keys, key)
+			}
+		}
+		p.cfg.Pool.Keys = keys
+		return nil
 	}
-	if err := p.cfg.RemovePoolKey(a.key.APIKey); err != nil {
+	if err := p.repo.SetEnabled(context.Background(), id, false, "exhausted"); err != nil {
 		a.disabled.Store(false)
-		return fmt.Errorf("persist account removal: %w", err)
+		return fmt.Errorf("persist account disable: %w", err)
 	}
 	return nil
+}
+
+func (p *Pool) SetEnabled(ctx context.Context, id int64, enabled bool) error {
+	return p.SetEnabledReason(ctx, id, enabled, "manual")
+}
+
+func (p *Pool) SetEnabledReason(ctx context.Context, id int64, enabled bool, reason string) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+
+	account := p.AccountByID(id)
+	if account == nil {
+		return fmt.Errorf("account not found")
+	}
+	if p.repo == nil {
+		return fmt.Errorf("account repository is unavailable")
+	}
+	account.removeMu.Lock()
+	defer account.removeMu.Unlock()
+
+	if !enabled {
+		if err := p.repo.SetEnabled(ctx, id, false, reason); err != nil {
+			return err
+		}
+		account.disabled.Store(true)
+		return nil
+	}
+
+	if !account.initialized.Load() {
+		if !account.initing.CompareAndSwap(false, true) {
+			return ErrInitializationInProgress
+		}
+		defer account.releaseInit()
+		result := initializeAccountWithRetry(ctx, p.cfg, account, false, maxWarmAttempts)
+		if result.err != nil {
+			account.disabled.Store(true)
+			_ = p.repo.SetEnabled(context.Background(), id, false, reason)
+			_ = p.repo.SetHealthError(context.Background(), id, "error", result.err.Error())
+			return result.err
+		}
+	}
+	if err := p.repo.SetEnabled(ctx, id, true, reason); err != nil {
+		account.disabled.Store(true)
+		return err
+	}
+	account.disabled.Store(false)
+	account.removed.Store(false)
+	p.addReady(account)
+	return nil
+}
+
+func (p *Pool) DeleteByID(ctx context.Context, id int64) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+
+	account := p.AccountByID(id)
+	if account == nil {
+		return fmt.Errorf("account not found")
+	}
+	if p.repo == nil {
+		return fmt.Errorf("account repository is unavailable")
+	}
+	account.removeMu.Lock()
+	defer account.removeMu.Unlock()
+	if err := p.repo.DeleteAccount(ctx, id); err != nil {
+		return err
+	}
+	account.disabled.Store(true)
+	account.removed.Store(true)
+	return nil
+}
+
+func (p *Pool) Refresh(ctx context.Context, id int64) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
+
+	account := p.AccountByID(id)
+	if account == nil {
+		return fmt.Errorf("account not found")
+	}
+	account.removeMu.Lock()
+	defer account.removeMu.Unlock()
+	if !account.initing.CompareAndSwap(false, true) {
+		return ErrInitializationInProgress
+	}
+	defer account.releaseInit()
+	result := initializeAccountWithRetry(ctx, p.cfg, account, false, 1)
+	if result.err != nil {
+		return result.err
+	}
+	if !account.ready.Load() {
+		p.addReady(account)
+	}
+	return nil
+}
+
+func (p *Pool) MarkInvalid(ctx context.Context, account *Account, cause error) {
+	if p.repo == nil || account == nil || account.DatabaseID() == 0 {
+		return
+	}
+	_ = p.repo.SetHealthError(ctx, account.DatabaseID(), "invalid", cause.Error())
 }
 
 // Pick selects an account by the configured strategy.

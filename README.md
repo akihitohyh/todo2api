@@ -16,7 +16,8 @@ allowing the upstream agent to execute local device tools itself.
 - Claude Code-compatible top-level `system`, cache-control, thinking, and tool history handling
 - Dynamically discovered `/v1/models` catalog and optional gateway bearer-token authentication
 - Round-robin and least-busy account selection
-- Automatic account failover, cooldowns, and persistent removal of exhausted keys
+- Automatic account failover, cooldowns, and persistent disabling of exhausted keys
+- Encrypted SQLite API key storage and an embedded management WebUI
 - Correct todofor.ai frontend WebSocket subscription flow
 - Client-side tool calls with `finish_reason: "tool_calls"`
 - In-memory continuation by canonical history hash
@@ -65,8 +66,39 @@ This was checked against the current public
 ```bash
 cp config.example.yaml config.yaml
 export TODOFOR_API_KEY='your-todofor-api-key'
+# Generate once, then paste the output into storage.master_key in config.yaml.
+openssl rand -base64 32
 go run ./cmd/todo2api -config config.yaml
 ```
+
+Open `http://localhost:8080` and sign in with `web.admin_username` and
+`web.admin_password`. The WebUI manages API keys, health checks, balances, and
+local gateway usage statistics. Registration automation is intentionally
+disabled.
+
+## Build for Linux
+
+The build script installs the locked WebUI dependencies, builds the embedded
+frontend, runs the Go test suite, and produces a static Linux binary plus its
+SHA-256 checksum:
+
+```bash
+./build.sh
+./build.sh --arch arm64
+```
+
+The default output is `build/todo2api-linux-<arch>`. Run `./build.sh --help` for
+custom output paths and options to reuse an existing WebUI build or skip tests.
+
+`storage.master_key` must contain the Base64 encoding of exactly 32 bytes and
+must remain stable. It is used to derive the AES-256-GCM key that encrypts
+upstream API keys in SQLite; a missing or different key makes startup fail
+instead of silently losing access to credentials. Protect `config.yaml` with
+mode `0600`. Relative `storage.path` values resolve from the configuration file
+directory.
+When deploying behind a reverse proxy, list its source CIDRs in
+`web.trusted_proxies`. Forwarded headers are ignored for every other peer; the
+trusted proxy must overwrite client-supplied forwarded headers.
 
 For each account, startup loads the configured `agent_id` as the complete
 `AgentSettings` template, or selects the account's first saved agent when the
@@ -100,8 +132,8 @@ aliases under `models.aliases` override discovered IDs on collision. A
 transient catalog failure is logged as a startup warning and falls back to the
 configured aliases and short default name instead of preventing startup.
 
-Large account pools can be loaded from files without expanding the YAML or
-systemd environment. Each file contains one API key per line; blank lines,
+On the first start with an empty database, legacy account pools can be imported
+from YAML and key files. Each file contains one API key per line; blank lines,
 comments, and duplicates are ignored:
 
 ```yaml
@@ -112,33 +144,28 @@ pool:
   keys: []
 ```
 
+The import is transactional and permanently marked in SQLite. After it
+succeeds, YAML and key files are retained for rollback but are never read
+again, even if every database account is later deleted. Add, disable, restore,
+and permanently delete keys through the WebUI or management API.
+
 The first configured accounts are initialized synchronously so the gateway can
 start in seconds. Remaining accounts are initialized in small background
-batches while retaining file order for round-robin selection. Temporary
-initialization failures are retried; accounts that still cannot load a project
-or Agent template are skipped. Startup fails only when none are usable.
+batches while retaining stable database IDs for pool reconciliation. Temporary
+initialization failures are retried and exposed in the WebUI. The service can
+start with an empty or temporarily unusable account pool; `/v1` returns `503`
+until a usable key is available.
 
 For new conversations, the gateway retries another available account after a
 recognized account failure. HTTP `429` temporarily cools an account down, while
 HTTP `402` or an explicit insufficient-balance/subscription-required response
-permanently disables the account and removes its key from both inline
-`pool.keys` entries and configured `pool.key_files`. Credential files are
-rewritten with `fsync` and an atomic rename, so removed keys do not return after
-a configuration reload or service restart. If no account can accept a new
+persistently disables the account as exhausted while preserving its encrypted
+credential and diagnostics for later recovery. If no account can accept a new
 conversation, the gateway returns HTTP `503` with `Retry-After: 60`.
 
-When `pool.key_files` is set, those files are polled every 2s (500ms debounce).
-On content change the gateway re-reads the config source plus key files, merges
-them, and hot-updates the account pool:
-
-- **added** keys are initialized in the background and enter rotation
-- **removed** keys are soft-deleted: excluded from new `Pick` traffic, but keep
-  their account index so in-flight multi-turn sessions can finish
-- **reappearing** keys are restored in place (same index) when possible
-
-Atomic replace of a key file is safe: a brief missing/unreadable file skips that
-tick and keeps the last good set. Restart is not required for key file edits.
-Hot reload also respects permanent key removals written by account failover.
+Account balance and subscription health are refreshed at startup, every five
+minutes, or on demand from the WebUI. SQLite remains the only live credential
+source after the one-time import.
 
 Basic request:
 
@@ -274,8 +301,8 @@ Tests include an HTTP/WebSocket mock of the official subscription protocol,
 pre-terminal delta timing, split tool-tag filtering, cancellation, tool-call
 continuation, Responses Item/SSE conversion, Anthropic content/SSE conversion,
 Claude Code system-message conversion, exact `runMeta` usage mapping,
-account-pool selection, exhausted-account failover, and persistent credential
-removal across configuration reloads. Live account verification still requires
+account-pool selection, exhausted-account failover, encrypted credential
+migration, and management authentication. Live account verification still requires
 a valid todofor.ai API key; use
 `examples/tool_call_curl.sh` as the account-level probe.
 
