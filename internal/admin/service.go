@@ -39,6 +39,8 @@ type Service struct {
 	trustedProxies []*net.IPNet
 	reloadMu       sync.Mutex
 	reload         reloadState
+	autoRefreshMu  sync.Mutex
+	autoRefreshing bool
 	accountLocks   sync.Map
 	workers        sync.WaitGroup
 }
@@ -186,7 +188,7 @@ func (s *Service) handleBulkAccounts(w http.ResponseWriter, r *http.Request) {
 				s.hub.publish("accounts")
 				return
 			}
-			_ = s.startRefreshAll()
+			_ = s.startAutomaticRefreshAll()
 		}()
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -261,7 +263,7 @@ func parseBulkKeys(input string) []string {
 }
 
 func (s *Service) Run(ctx context.Context) {
-	_ = s.startRefreshAll()
+	_ = s.startAutomaticRefreshAll()
 	ticker := time.NewTicker(5 * time.Minute)
 	cleanup := time.NewTicker(time.Hour)
 	defer ticker.Stop()
@@ -271,7 +273,7 @@ func (s *Service) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = s.startRefreshAll()
+			_ = s.startAutomaticRefreshAll()
 		case <-cleanup.C:
 			if err := s.store.CleanupSessions(ctx); err != nil {
 				log.Printf("admin session cleanup: %v", err)
@@ -502,39 +504,126 @@ func (s *Service) handleReload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 405, "method not allowed")
 		return
 	}
-	s.reloadMu.Lock()
-	running := s.reload.running
-	s.reloadMu.Unlock()
-	if !running {
-		if err := s.startRefreshAll(); err != nil {
+	var req struct {
+		AccountIDs json.RawMessage `json:"account_ids"`
+	}
+	if r.Body != nil {
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		err := decoder.Decode(&req)
+		if err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, 400, "invalid request body")
+			return
+		}
+		if err == nil && decoder.Decode(&struct{}{}) != io.EOF {
+			writeError(w, 400, "invalid request body")
+			return
+		}
+	}
+	if req.AccountIDs == nil {
+		started, err := s.startManualRefreshAll()
+		if err != nil {
 			writeError(w, 500, "start health check failed")
+			return
+		}
+		if !started {
+			writeError(w, http.StatusConflict, "health check already running")
+			return
+		}
+	} else {
+		var accountIDs []int64
+		if err := json.Unmarshal(req.AccountIDs, &accountIDs); err != nil || accountIDs == nil {
+			writeError(w, 400, "account_ids must be an array of integers")
+			return
+		}
+		accounts, err := s.accountsForRefresh(r.Context(), accountIDs)
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		if !s.startRefresh(accounts) {
+			writeError(w, http.StatusConflict, "health check already running")
 			return
 		}
 	}
 	writeJSON(w, 202, map[string]string{"status": "started"})
 }
 
-func (s *Service) startRefreshAll() error {
+func (s *Service) startManualRefreshAll() (bool, error) {
 	accounts, err := s.store.Accounts(s.ctx)
 	if err != nil {
+		return false, err
+	}
+	return s.startRefresh(accounts), nil
+}
+
+func (s *Service) startAutomaticRefreshAll() error {
+	s.autoRefreshMu.Lock()
+	if s.autoRefreshing {
+		s.autoRefreshMu.Unlock()
+		return nil
+	}
+	s.autoRefreshing = true
+	s.autoRefreshMu.Unlock()
+
+	accounts, err := s.store.Accounts(s.ctx)
+	if err != nil {
+		s.autoRefreshMu.Lock()
+		s.autoRefreshing = false
+		s.autoRefreshMu.Unlock()
 		return err
 	}
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		s.refreshAccounts(s.ctx, accounts, false)
+		s.autoRefreshMu.Lock()
+		s.autoRefreshing = false
+		s.autoRefreshMu.Unlock()
+	}()
+	return nil
+}
+
+func (s *Service) accountsForRefresh(ctx context.Context, ids []int64) ([]storage.Account, error) {
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("account_ids must not be empty")
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	accounts := make([]storage.Account, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("account_ids must contain positive integers")
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		account, err := s.store.Account(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("account %d not found", id)
+		}
+		seen[id] = struct{}{}
+		accounts = append(accounts, account)
+	}
+	return accounts, nil
+}
+
+func (s *Service) startRefresh(accounts []storage.Account) bool {
 	s.reloadMu.Lock()
 	if s.reload.running {
 		s.reloadMu.Unlock()
-		return nil
+		return false
 	}
 	s.reload = reloadState{running: true, total: len(accounts), subs: s.reload.subs}
 	s.reloadMu.Unlock()
 	s.workers.Add(1)
 	go func() {
 		defer s.workers.Done()
-		s.refreshAccounts(s.ctx, accounts)
+		s.refreshAccounts(s.ctx, accounts, true)
 	}()
-	return nil
+	return true
 }
 
-func (s *Service) refreshAccounts(ctx context.Context, accounts []storage.Account) {
+func (s *Service) refreshAccounts(ctx context.Context, accounts []storage.Account, trackProgress bool) {
 	jobs := make(chan int64)
 	var wg sync.WaitGroup
 	for range 2 {
@@ -543,6 +632,9 @@ func (s *Service) refreshAccounts(ctx context.Context, accounts []storage.Accoun
 			defer wg.Done()
 			for id := range jobs {
 				a, err := s.refreshOne(ctx, id)
+				if !trackProgress {
+					continue
+				}
 				s.reloadMu.Lock()
 				s.reload.done++
 				if err != nil {
@@ -565,10 +657,12 @@ loop:
 	}
 	close(jobs)
 	wg.Wait()
-	s.reloadMu.Lock()
-	s.reload.running = false
-	s.broadcastProgressLocked()
-	s.reloadMu.Unlock()
+	if trackProgress {
+		s.reloadMu.Lock()
+		s.reload.running = false
+		s.broadcastProgressLocked()
+		s.reloadMu.Unlock()
+	}
 	s.hub.publish("accounts")
 	s.hub.publish("stats")
 }

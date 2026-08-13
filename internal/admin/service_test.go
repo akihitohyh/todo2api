@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -289,5 +290,165 @@ func TestExpiredSessionRejected(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expired status=%d", rec.Code)
+	}
+}
+
+func postReload(t *testing.T, handler http.Handler, cookie *http.Cookie, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "http://example.test/api/accounts/reload", strings.NewReader(body))
+	req.AddCookie(cookie)
+	req.Header.Set("Origin", "http://example.test")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestReloadSelectedAccountsAndStream(t *testing.T) {
+	service, mux, store := testService(t)
+	cookie := login(t, mux)
+	first, err := store.CreateAccount(context.Background(), config.AccountKey{APIKey: "sk-selected-first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateAccount(context.Background(), config.AccountKey{APIKey: "sk-selected-second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := fmt.Sprintf(`{"account_ids":[%d,%d]}`, second.ID, second.ID)
+	rec := postReload(t, mux, cookie, body)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("selected reload=%d %s", rec.Code, rec.Body.String())
+	}
+	service.Wait()
+	service.reloadMu.Lock()
+	progress := service.progressLocked()
+	service.reloadMu.Unlock()
+	if progress.Running || progress.Total != 1 || progress.Done != 1 {
+		t.Fatalf("selected progress=%+v", progress)
+	}
+	unchanged, err := store.Account(context.Background(), first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.BalanceAt != nil {
+		t.Fatalf("unselected account was refreshed: %+v", unchanged)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/api/accounts/reload/stream", nil)
+	req.AddCookie(cookie)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"total":1`) || !strings.Contains(rec.Body.String(), "data: [DONE]") {
+		t.Fatalf("reload stream=%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReloadRequestValidationAndCompatibility(t *testing.T) {
+	service, mux, store := testService(t)
+	cookie := login(t, mux)
+	for _, key := range []string{"sk-reload-first", "sk-reload-second"} {
+		if _, err := store.CreateAccount(context.Background(), config.AccountKey{APIKey: key}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for name, body := range map[string]string{
+		"empty IDs":       `{"account_ids":[]}`,
+		"null IDs":        `{"account_ids":null}`,
+		"non-positive ID": `{"account_ids":[0]}`,
+		"missing ID":      `{"account_ids":[999999]}`,
+		"wrong type":      `{"account_ids":"1"}`,
+		"unknown field":   `{"ids":[1]}`,
+		"trailing JSON":   `{} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := postReload(t, mux, cookie, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("reload=%d %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	rec := postReload(t, mux, cookie, "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("full reload=%d %s", rec.Code, rec.Body.String())
+	}
+	service.Wait()
+	service.reloadMu.Lock()
+	progress := service.progressLocked()
+	service.reloadMu.Unlock()
+	if progress.Total != 2 || progress.Done != 2 {
+		t.Fatalf("full progress=%+v", progress)
+	}
+
+	rec = postReload(t, mux, cookie, `{}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("object full reload=%d %s", rec.Code, rec.Body.String())
+	}
+	service.Wait()
+}
+
+func TestReloadRejectsConcurrentTask(t *testing.T) {
+	service, mux, _ := testService(t)
+	cookie := login(t, mux)
+	service.reloadMu.Lock()
+	service.reload.running = true
+	service.reloadMu.Unlock()
+
+	rec := postReload(t, mux, cookie, "")
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "already running") {
+		t.Fatalf("concurrent reload=%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestManualReloadRunsWhileAutomaticRefreshIsActive(t *testing.T) {
+	service, mux, store := testService(t)
+	cookie := login(t, mux)
+	account, err := store.CreateAccount(context.Background(), config.AccountKey{APIKey: "sk-manual-during-auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		writeJSON(w, http.StatusOK, map[string]any{
+			"totalBalance":              10,
+			"hasActivePaidSubscription": true,
+		})
+	}))
+	defer upstreamServer.Close()
+	service.cfg.Upstream.BaseURL = upstreamServer.URL
+	if err := service.startAutomaticRefreshAll(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("automatic refresh did not start")
+	}
+
+	rec := postReload(t, mux, cookie, fmt.Sprintf(`{"account_ids":[%d]}`, account.ID))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("manual reload during automatic refresh=%d %s", rec.Code, rec.Body.String())
+	}
+	close(release)
+	service.Wait()
+	service.reloadMu.Lock()
+	progress := service.progressLocked()
+	service.reloadMu.Unlock()
+	if progress.Running || progress.Total != 1 || progress.Done != 1 {
+		t.Fatalf("manual progress=%+v", progress)
+	}
+	service.autoRefreshMu.Lock()
+	autoRefreshing := service.autoRefreshing
+	service.autoRefreshMu.Unlock()
+	if autoRefreshing {
+		t.Fatal("automatic refresh remained active")
 	}
 }
