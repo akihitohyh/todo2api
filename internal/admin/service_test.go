@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -200,6 +201,79 @@ func TestAccountCRUDAndOriginProtection(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete=%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBulkAccountImportAcceptsLinesAndReportsDuplicates(t *testing.T) {
+	_, mux, store := testService(t)
+	cookie := login(t, mux)
+	body := []byte(`{"keys":"# comment\nsk-bulk-one\n\nsk-bulk-two\nsk-bulk-one\n"}`)
+	req := httptest.NewRequest(http.MethodPost, "http://example.test/api/accounts/bulk", bytes.NewReader(body))
+	req.AddCookie(cookie)
+	req.Header.Set("Origin", "http://example.test")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bulk status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var result bulkAccountResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Total != 2 || result.Created != 2 || result.Duplicates != 0 || result.Failed != 0 {
+		t.Fatalf("bulk result=%#v", result)
+	}
+	accounts, err := store.Accounts(context.Background())
+	if err != nil || len(accounts) != 2 {
+		t.Fatalf("accounts=%v err=%v", accounts, err)
+	}
+	if strings.Contains(rec.Body.String(), "sk-bulk-one") || strings.Contains(rec.Body.String(), "sk-bulk-two") {
+		t.Fatalf("bulk response leaked plaintext key: %s", rec.Body.String())
+	}
+
+	duplicate := httptest.NewRequest(http.MethodPost, "http://example.test/api/accounts/bulk", strings.NewReader(`{"keys":["sk-bulk-one","sk-bulk-three"]}`))
+	duplicate.AddCookie(cookie)
+	duplicate.Header.Set("Origin", "http://example.test")
+	duplicate.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, duplicate)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("duplicate status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Total != 2 || result.Created != 1 || result.Duplicates != 1 {
+		t.Fatalf("duplicate result=%#v", result)
+	}
+}
+
+func TestBulkAccountImportAcceptsMultipartFile(t *testing.T) {
+	_, mux, store := testService(t)
+	cookie := login(t, mux)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	file, err := writer.CreateFormFile("file", "keys.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = file.Write([]byte("sk-file-one\n# ignored\nsk-file-two\n"))
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://example.test/api/accounts/bulk", &body)
+	req.AddCookie(cookie)
+	req.Header.Set("Origin", "http://example.test")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("multipart status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	accounts, err := store.Accounts(context.Background())
+	if err != nil || len(accounts) != 2 {
+		t.Fatalf("accounts=%v err=%v", accounts, err)
 	}
 }
 

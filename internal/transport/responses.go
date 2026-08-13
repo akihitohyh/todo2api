@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -66,9 +67,13 @@ type responsesToolTarget struct {
 }
 
 type responsesContentPart struct {
-	Type    string `json:"type"`
-	Text    string `json:"text,omitempty"`
-	Refusal string `json:"refusal,omitempty"`
+	Type           string          `json:"type"`
+	Text           string          `json:"text,omitempty"`
+	Refusal        string          `json:"refusal,omitempty"`
+	ImageURL       json.RawMessage `json:"image_url,omitempty"`
+	ImageURLCompat json.RawMessage `json:"imageUrl,omitempty"` // common camelCase client variant
+	FileID         string          `json:"file_id,omitempty"`
+	Detail         string          `json:"detail,omitempty"`
 }
 
 type responsesUsage struct {
@@ -426,16 +431,113 @@ func responsesText(raw json.RawMessage) (string, error) {
 	}
 	var text strings.Builder
 	for _, part := range parts {
+		var value string
 		switch part.Type {
 		case "input_text", "output_text", "text":
-			text.WriteString(part.Text)
+			value = part.Text
 		case "refusal":
-			text.WriteString(part.Refusal)
+			value = part.Refusal
+		case "input_image":
+			ref, err := responsesImageReference(part)
+			if err != nil {
+				return "", err
+			}
+			value = ref
 		default:
 			return "", fmt.Errorf("unsupported content part %q", part.Type)
 		}
+		if value != "" && text.Len() > 0 {
+			text.WriteString("\n\n")
+		}
+		text.WriteString(value)
 	}
 	return text.String(), nil
+}
+
+// responsesImageReference keeps an input_image useful when the upstream todo
+// API cannot receive OpenAI's multipart/image content directly. HTTP(S) URLs
+// are passed through as a fetchable reference; data URLs are summarized so a
+// large base64 payload does not consume the agent context. file_id needs an
+// upload/attachment lookup that this gateway does not currently implement.
+func responsesImageReference(part responsesContentPart) (string, error) {
+	source := bytes.TrimSpace(part.ImageURL)
+	if len(source) == 0 || bytes.Equal(source, []byte("null")) {
+		source = bytes.TrimSpace(part.ImageURLCompat)
+	}
+	if len(source) > 0 && !bytes.Equal(source, []byte("null")) {
+		value, err := responsesStringValue(source)
+		if err != nil {
+			return "", fmt.Errorf("invalid input_image image_url: %w", err)
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return "", fmt.Errorf("input_image image_url must not be empty")
+		}
+		if strings.HasPrefix(strings.ToLower(value), "data:") {
+			return dataURLImageReference(value)
+		}
+		if !isHTTPURL(value) {
+			return "", fmt.Errorf("input_image image_url must be an http(s) or data URL")
+		}
+		if part.Detail != "" {
+			return fmt.Sprintf("[input image detail=%s]\n%s", part.Detail, value), nil
+		}
+		return "[input image]\n" + value, nil
+	}
+	if part.FileID != "" {
+		return "", fmt.Errorf("input_image file_id %q is not supported; send image_url instead", part.FileID)
+	}
+	return "", fmt.Errorf("input_image requires image_url or file_id")
+}
+
+func responsesStringValue(raw json.RawMessage) (string, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil
+	}
+	if raw[0] == '"' {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+	// Chat-style clients sometimes send image_url as {"url":"..."}.
+	var object struct {
+		URL    string `json:"url"`
+		Detail string `json:"detail,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return "", err
+	}
+	return object.URL, nil
+}
+
+func isHTTPURL(value string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return strings.EqualFold(parsed.Scheme, "https") || strings.EqualFold(parsed.Scheme, "http")
+}
+
+func dataURLImageReference(value string) (string, error) {
+	comma := strings.IndexByte(value, ',')
+	if comma <= len("data:") {
+		return "", fmt.Errorf("input_image data URL is malformed")
+	}
+	header := value[len("data:"):comma]
+	mime := strings.SplitN(header, ";", 2)[0]
+	if !strings.HasPrefix(strings.ToLower(mime), "image/") {
+		return "", fmt.Errorf("input_image data URL must contain an image MIME type")
+	}
+	encoded := value[comma+1:]
+	if strings.Contains(strings.ToLower(header), ";base64") {
+		// Base64 is four characters per three bytes; this is only a size hint.
+		approxBytes := (len(encoded) * 3) / 4
+		return fmt.Sprintf("[input image data URL: %s, approximately %d bytes]", mime, approxBytes), nil
+	}
+	return fmt.Sprintf("[input image data URL: %s]", mime), nil
 }
 
 func responsesAgentMessageText(raw json.RawMessage) (string, error) {
