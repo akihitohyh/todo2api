@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -74,6 +75,7 @@ type responsesContentPart struct {
 	ImageURLCompat json.RawMessage `json:"imageUrl,omitempty"` // common camelCase client variant
 	FileID         string          `json:"file_id,omitempty"`
 	Detail         string          `json:"detail,omitempty"`
+	Name           string          `json:"name,omitempty"`
 }
 
 type responsesUsage struct {
@@ -234,10 +236,11 @@ func (r responsesRequest) chatRequest(todoID string) (openai.ChatRequest, map[st
 				if role != "system" && role != "user" && role != "assistant" {
 					return openai.ChatRequest{}, nil, fmt.Errorf("unsupported input message role %q", item.Role)
 				}
-				text, err := responsesText(item.Content)
+				text, attachments, err := responsesInputContent(item.Content)
 				if err != nil {
 					return openai.ChatRequest{}, nil, fmt.Errorf("invalid message content: %w", err)
 				}
+				chat.Attachments = append(chat.Attachments, attachments...)
 				chat.Messages = append(chat.Messages, openai.ChatMessage{Role: role, Content: text})
 			case "agent_message":
 				text, err := responsesAgentMessageText(item.Content)
@@ -452,6 +455,133 @@ func responsesText(raw json.RawMessage) (string, error) {
 		text.WriteString(value)
 	}
 	return text.String(), nil
+}
+
+func responsesInputContent(raw json.RawMessage) (string, []openai.AttachmentInput, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil, nil
+	}
+	if raw[0] == '"' {
+		text, err := responsesText(raw)
+		return text, nil, err
+	}
+	var parts []responsesContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", nil, err
+	}
+	var text strings.Builder
+	var attachments []openai.AttachmentInput
+	for _, part := range parts {
+		switch part.Type {
+		case "input_text", "output_text", "text":
+			if part.Text != "" {
+				if text.Len() > 0 {
+					text.WriteString("\n\n")
+				}
+				text.WriteString(part.Text)
+			}
+		case "refusal":
+			if part.Refusal != "" {
+				if text.Len() > 0 {
+					text.WriteString("\n\n")
+				}
+				text.WriteString(part.Refusal)
+			}
+		case "input_image":
+			attachment, reference, err := responsesImageAttachment(part, len(attachments)+1)
+			if err != nil {
+				return "", nil, err
+			}
+			if attachment != nil {
+				attachments = append(attachments, *attachment)
+				if text.Len() > 0 {
+					text.WriteString("\n\n")
+				}
+				text.WriteString("[image attached: " + attachment.Name + "]")
+			} else if reference != "" {
+				if text.Len() > 0 {
+					text.WriteString("\n\n")
+				}
+				text.WriteString(reference)
+			}
+		default:
+			return "", nil, fmt.Errorf("unsupported content part %q", part.Type)
+		}
+	}
+	return text.String(), attachments, nil
+}
+
+func responsesImageAttachment(part responsesContentPart, index int) (*openai.AttachmentInput, string, error) {
+	source := bytes.TrimSpace(part.ImageURL)
+	if len(source) == 0 || bytes.Equal(source, []byte("null")) {
+		source = bytes.TrimSpace(part.ImageURLCompat)
+	}
+	if len(source) == 0 || bytes.Equal(source, []byte("null")) {
+		if part.FileID != "" {
+			return nil, "", fmt.Errorf("input_image file_id %q is not supported; send image_url instead", part.FileID)
+		}
+		return nil, "", fmt.Errorf("input_image requires image_url or file_id")
+	}
+	value, err := responsesStringValue(source)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid input_image image_url: %w", err)
+	}
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(strings.ToLower(value), "data:") {
+		mimeType, data, err := decodeImageDataURL(value)
+		if err != nil {
+			return nil, "", err
+		}
+		name := part.Name
+		if name == "" {
+			name = fmt.Sprintf("image-%d.%s", index, imageExtension(mimeType))
+		}
+		return &openai.AttachmentInput{Name: name, MIMEType: mimeType, Data: data}, "", nil
+	}
+	if !isHTTPURL(value) {
+		return nil, "", fmt.Errorf("input_image image_url must be an http(s) or data URL")
+	}
+	return nil, "[image URL provided but not uploaded]\n" + value, nil
+}
+
+func decodeImageDataURL(value string) (string, []byte, error) {
+	comma := strings.IndexByte(value, ',')
+	if comma <= len("data:") {
+		return "", nil, fmt.Errorf("input_image data URL is malformed")
+	}
+	header := value[len("data:"):comma]
+	mimeType := strings.SplitN(header, ";", 2)[0]
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return "", nil, fmt.Errorf("input_image data URL must contain an image MIME type")
+	}
+	encoded := value[comma+1:]
+	var data []byte
+	var err error
+	if strings.Contains(strings.ToLower(header), ";base64") {
+		data, err = base64.StdEncoding.DecodeString(encoded)
+	} else {
+		var decoded string
+		decoded, err = url.PathUnescape(encoded)
+		data = []byte(decoded)
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("decode input_image data: %w", err)
+	}
+	if len(data) == 0 {
+		return "", nil, fmt.Errorf("input_image data URL is empty")
+	}
+	if len(data) > 20<<20 {
+		return "", nil, fmt.Errorf("input_image is larger than 20 MiB")
+	}
+	return mimeType, data, nil
+}
+
+func imageExtension(mimeType string) string {
+	if i := strings.LastIndexByte(mimeType, '/'); i >= 0 && i+1 < len(mimeType) {
+		return strings.ToLower(mimeType[i+1:])
+	}
+	return "bin"
 }
 
 // responsesImageReference keeps an input_image useful when the upstream todo

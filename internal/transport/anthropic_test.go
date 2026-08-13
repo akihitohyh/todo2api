@@ -12,6 +12,20 @@ import (
 	"todo2api/internal/openai"
 )
 
+func TestAnthropicImageBlockBecomesAttachment(t *testing.T) {
+	req := anthropicRequest{Model: "public-model", Messages: []anthropicInputMessage{{Role: "user", Content: json.RawMessage(`[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]`)}}}
+	chat, err := req.chatRequest("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Attachments) != 1 || chat.Attachments[0].MIMEType != "image/png" || len(chat.Attachments[0].Data) != 3 {
+		t.Fatalf("attachments=%#v", chat.Attachments)
+	}
+	if !strings.Contains(chat.Messages[0].Content, "image attached") {
+		t.Fatalf("content=%q", chat.Messages[0].Content)
+	}
+}
+
 func TestAnthropicRequestConvertsToolHistory(t *testing.T) {
 	req := anthropicRequest{
 		Model:  "public-model",

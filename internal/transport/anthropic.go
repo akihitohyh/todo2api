@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -38,6 +39,10 @@ type anthropicContentBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+	Source    json.RawMessage `json:"source,omitempty"`
+	MediaType string          `json:"media_type,omitempty"`
+	Data      string          `json:"data,omitempty"`
+	URL       string          `json:"url,omitempty"`
 }
 
 type anthropicTool struct {
@@ -191,6 +196,16 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 				switch block.Type {
 				case "text":
 					text.WriteString(block.Text)
+				case "image":
+					attachment, err := anthropicImageAttachment(block)
+					if err != nil {
+						return openai.ChatRequest{}, fmt.Errorf("invalid image content: %w", err)
+					}
+					chat.Attachments = append(chat.Attachments, attachment)
+					if text.Len() > 0 {
+						text.WriteString("\n\n")
+					}
+					text.WriteString("[image attached: " + attachment.Name + "]")
 				case "tool_result":
 					flushText()
 					if block.ToolUseID == "" {
@@ -242,6 +257,53 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 		})
 	}
 	return chat, nil
+}
+
+func anthropicImageAttachment(block anthropicContentBlock) (openai.AttachmentInput, error) {
+	source := bytes.TrimSpace(block.Source)
+	if len(source) == 0 || bytes.Equal(source, []byte("null")) {
+		return openai.AttachmentInput{}, fmt.Errorf("image source is required")
+	}
+	var sourceObject struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+		URL       string `json:"url"`
+	}
+	if err := json.Unmarshal(source, &sourceObject); err != nil {
+		return openai.AttachmentInput{}, err
+	}
+	if sourceObject.Type == "url" || sourceObject.URL != "" {
+		return openai.AttachmentInput{}, fmt.Errorf("remote image URLs are not downloadable by this gateway; send base64 source")
+	}
+	if sourceObject.Type != "base64" && sourceObject.Data == "" {
+		return openai.AttachmentInput{}, fmt.Errorf("unsupported image source type %q", sourceObject.Type)
+	}
+	if sourceObject.Data == "" {
+		return openai.AttachmentInput{}, fmt.Errorf("base64 image data is empty")
+	}
+	mimeType := sourceObject.MediaType
+	if mimeType == "" {
+		mimeType = block.MediaType
+	}
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return openai.AttachmentInput{}, fmt.Errorf("image media_type must be image/*")
+	}
+	data, err := base64.StdEncoding.DecodeString(sourceObject.Data)
+	if err != nil {
+		return openai.AttachmentInput{}, fmt.Errorf("decode image data: %w", err)
+	}
+	if len(data) == 0 {
+		return openai.AttachmentInput{}, fmt.Errorf("image data is empty")
+	}
+	if len(data) > 20<<20 {
+		return openai.AttachmentInput{}, fmt.Errorf("image is larger than 20 MiB")
+	}
+	ext := "bin"
+	if i := strings.LastIndexByte(mimeType, '/'); i >= 0 {
+		ext = strings.ToLower(mimeType[i+1:])
+	}
+	return openai.AttachmentInput{Name: "image." + ext, MIMEType: mimeType, Data: data}, nil
 }
 
 func appendAnthropicSystem(system *string, content string) {

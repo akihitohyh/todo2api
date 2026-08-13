@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -121,6 +122,49 @@ func TestCreateAndAddMessageWireFormat(t *testing.T) {
 		if _, ok := body["filteredEdgeTools"].(map[string]any); !ok {
 			t.Fatalf("%s filteredEdgeTools = %#v", name, body["filteredEdgeTools"])
 		}
+	}
+}
+
+func TestRegisterAttachmentAndAttachFrame(t *testing.T) {
+	var uploadData []byte
+	var todoBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/resources/register":
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Fatal(err)
+			}
+			file, _, err := r.FormFile("file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			uploadData, _ = io.ReadAll(file)
+			json.NewEncoder(w).Encode(map[string]any{"attachmentId": "att-1", "uri": "todoforai:todos/todo-1/att-1", "originalName": "cat.png", "mimeType": "image/png", "fileSize": 3})
+		case "/api/v1/projects/project-1/todos":
+			if err := json.NewDecoder(r.Body).Decode(&todoBody); err != nil {
+				t.Fatal(err)
+			}
+			json.NewEncoder(w).Encode(Todo{ID: "todo-1", ProjectID: "project-1", Status: "RUNNING"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL+"/api/v1", "upstream-key")
+	frame, err := client.RegisterAttachment(context.Background(), AttachmentUpload{Name: "cat.png", MIMEType: "image/png", Data: []byte{0, 0, 0}}, "todo-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(uploadData) != "\x00\x00\x00" || frame.ID != "att-1" {
+		t.Fatalf("upload=%v frame=%#v", uploadData, frame)
+	}
+	if _, err := client.CreateTodoWithAttachments(context.Background(), "project-1", "[image attached]", AgentSettings{}, []AttachmentFrame{frame}); err != nil {
+		t.Fatal(err)
+	}
+	attachments, ok := todoBody["attachments"].([]any)
+	if !ok || len(attachments) != 1 {
+		t.Fatalf("todo attachments=%#v", todoBody["attachments"])
 	}
 }
 
