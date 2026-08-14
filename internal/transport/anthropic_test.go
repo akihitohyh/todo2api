@@ -410,9 +410,9 @@ func TestAnthropicCountTokensSharesDecodeErrors(t *testing.T) {
 }
 
 func TestAnthropicOversizedBodyRejected(t *testing.T) {
-	old := maxAnthropicBodyBytes
-	maxAnthropicBodyBytes = 1024
-	t.Cleanup(func() { maxAnthropicBodyBytes = old })
+	old := maxJSONBodyBytes
+	maxJSONBodyBytes = 1024
+	t.Cleanup(func() { maxJSONBodyBytes = old })
 
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(strings.Repeat("x", 1025)))

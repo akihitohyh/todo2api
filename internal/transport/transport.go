@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -116,13 +117,26 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req openai.ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid request body")
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
 	if len(req.Messages) == 0 {
 		writeErr(w, http.StatusBadRequest, "messages must not be empty")
 		return
+	}
+	for i := range req.Messages {
+		message := &req.Messages[i]
+		if len(message.Parts) == 0 {
+			continue
+		}
+		text, attachments, err := chatContentParts(message.Parts)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message.Content = text
+		req.Attachments = append(req.Attachments, attachments...)
 	}
 	if todoID := strings.TrimSpace(r.Header.Get(todoIDHeader)); todoID != "" {
 		if req.Metadata == nil {
@@ -151,6 +165,73 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(todoIDHeader, reply.TodoID)
 
 	writeJSON(w, http.StatusOK, buildResponse(reply))
+}
+
+// chatContentParts renders OpenAI content parts into message text and request
+// attachments. Text parts are joined with blank lines; image_url parts become
+// base64 attachments (or an inline note when the URL is remote), mirroring
+// responsesInputContent for the chat completions endpoint.
+func chatContentParts(parts []openai.ContentPart) (string, []openai.AttachmentInput, error) {
+	var text strings.Builder
+	var attachments []openai.AttachmentInput
+	for _, part := range parts {
+		switch part.Type {
+		case "text", "input_text", "":
+			if part.Text == "" {
+				continue
+			}
+			if text.Len() > 0 {
+				text.WriteString("\n\n")
+			}
+			text.WriteString(part.Text)
+		case "image_url":
+			attachment, reference, err := chatImageAttachment(part, len(attachments)+1)
+			if err != nil {
+				return "", nil, err
+			}
+			if text.Len() > 0 {
+				text.WriteString("\n\n")
+			}
+			if reference != "" {
+				text.WriteString(reference)
+			} else {
+				text.WriteString("[image attached: " + attachment.Name + "]")
+			}
+			if attachment != nil {
+				attachments = append(attachments, *attachment)
+			}
+		default:
+			return "", nil, fmt.Errorf("unsupported content part type %q", part.Type)
+		}
+	}
+	return text.String(), attachments, nil
+}
+
+// chatImageAttachment converts an OpenAI image_url content part into an
+// attachment, mirroring responsesImageAttachment for chat requests.
+func chatImageAttachment(part openai.ContentPart, index int) (*openai.AttachmentInput, string, error) {
+	source := bytes.TrimSpace(part.ImageURL)
+	if len(source) == 0 || bytes.Equal(source, []byte("null")) {
+		return nil, "", fmt.Errorf("image_url part requires an image_url value")
+	}
+	value, err := responsesStringValue(source)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid image_url: %w", err)
+	}
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(strings.ToLower(value), "data:") {
+		mimeType, data, err := decodeImageDataURL(value)
+		if err != nil {
+			return nil, "", err
+		}
+		return &openai.AttachmentInput{
+			Name: fmt.Sprintf("image-%d.%s", index, imageExtension(mimeType)), MIMEType: mimeType, Data: data,
+		}, "", nil
+	}
+	if !isHTTPURL(value) {
+		return nil, "", fmt.Errorf("image_url must be an http(s) or data URL")
+	}
+	return nil, "[image URL provided but not uploaded]\n" + value, nil
 }
 
 func buildResponse(reply *gateway.Reply) openai.ChatResponse {

@@ -83,23 +83,23 @@ type anthropicMessageResponse struct {
 	Usage        anthropicUsage         `json:"usage"`
 }
 
-// maxAnthropicBodyBytes caps how much of a /v1/messages-style body the server
-// will read. It sits above the 20 MiB decoded-image limit so base64 image
-// attachments still fit, while bounding memory use on malformed or hostile
-// input. It is a variable only so tests can exercise the cap cheaply.
-var maxAnthropicBodyBytes = 64 << 20
+// maxJSONBodyBytes caps how much of a JSON request body the server will read.
+// It sits above the 20 MiB decoded-image limit so base64 image attachments
+// still fit, while bounding memory use on malformed or hostile input. It is a
+// variable only so tests can exercise the cap cheaply.
+var maxJSONBodyBytes = 64 << 20
 
-// anthropicBodyError reports a body decode failure. Error() is always the
-// redacted detail — field names, JSON types, byte offsets — and never contains
-// body values, so it is safe to expose to clients. The underlying error stays
+// jsonBodyError reports a body decode failure. Error() is always the redacted
+// detail — field names, JSON types, byte offsets — and never contains body
+// values, so it is safe to expose to clients. The underlying error stays
 // reachable through Unwrap for server-side logging.
-type anthropicBodyError struct {
+type jsonBodyError struct {
 	detail string
 	cause  error
 }
 
-func (e *anthropicBodyError) Error() string { return e.detail }
-func (e *anthropicBodyError) Unwrap() error { return e.cause }
+func (e *jsonBodyError) Error() string { return e.detail }
+func (e *jsonBodyError) Unwrap() error { return e.cause }
 
 // decodeAnthropicRequest decodes a Claude Code /v1/messages-style body into an
 // anthropicRequest. /v1/messages and /v1/messages/count_tokens share it so both
@@ -108,52 +108,62 @@ func (e *anthropicBodyError) Unwrap() error { return e.cause }
 // Unknown top-level fields are deliberately tolerated: Claude Code sends
 // fields this gateway does not interpret (thinking, context_management,
 // tool_choice, cache_control, ...) and rejecting them would break
-// compatibility. The body must be exactly one JSON value: empty bodies, JSON
-// syntax errors, field type mismatches, oversized bodies, and trailing data
-// are distinguished so the failure is actionable.
+// compatibility.
 func decodeAnthropicRequest(r *http.Request) (anthropicRequest, error) {
-	if encoding := strings.TrimSpace(r.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		return anthropicRequest{}, fmt.Errorf("unsupported Content-Encoding %q (only identity is supported)", encoding)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxAnthropicBodyBytes+1)))
-	if err != nil {
-		return anthropicRequest{}, fmt.Errorf("read request body: %w", err)
-	}
-	if len(body) > maxAnthropicBodyBytes {
-		return anthropicRequest{}, fmt.Errorf("request body exceeds %d MiB", (maxAnthropicBodyBytes+(1<<20)-1)>>20)
-	}
-
 	var req anthropicRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		return anthropicRequest{}, err
+	}
+	return req, nil
+}
+
+// decodeJSONBody decodes a JSON request body into target with diagnostics
+// shared by every endpoint: empty bodies, JSON syntax errors, field type
+// mismatches, oversized bodies, and trailing data are distinguished, unknown
+// fields are tolerated, and non-identity Content-Encoding is rejected
+// explicitly. The returned error never contains body values.
+func decodeJSONBody(r *http.Request, target any) error {
+	if encoding := strings.TrimSpace(r.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		return fmt.Errorf("unsupported Content-Encoding %q (only identity is supported)", encoding)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxJSONBodyBytes+1)))
+	if err != nil {
+		return fmt.Errorf("read request body: %w", err)
+	}
+	if len(body) > maxJSONBodyBytes {
+		return fmt.Errorf("request body exceeds %d MiB", (maxJSONBodyBytes+(1<<20)-1)>>20)
+	}
+
 	decoder := json.NewDecoder(bytes.NewReader(body))
-	if err := decoder.Decode(&req); err != nil {
+	if err := decoder.Decode(target); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return anthropicRequest{}, &anthropicBodyError{
+			return &jsonBodyError{
 				detail: fmt.Sprintf("unexpected end of JSON input at byte offset %d", len(body)),
 				cause:  err,
 			}
 		}
-		return anthropicRequest{}, &anthropicBodyError{detail: anthropicDecodeError(err), cause: err}
+		return &jsonBodyError{detail: jsonDecodeError(err), cause: err}
 	}
 	// The body must contain exactly one JSON value: a second successful Decode
 	// means trailing JSON, and any other non-EOF error means trailing garbage.
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		if err == nil {
-			return anthropicRequest{}, fmt.Errorf("request body contains multiple JSON values")
+			return fmt.Errorf("request body contains multiple JSON values")
 		}
-		return anthropicRequest{}, &anthropicBodyError{
-			detail: "request body contains trailing data: " + anthropicDecodeError(err),
+		return &jsonBodyError{
+			detail: "request body contains trailing data: " + jsonDecodeError(err),
 			cause:  err,
 		}
 	}
-	return req, nil
+	return nil
 }
 
-// anthropicDecodeError renders a JSON decode failure as a safe, concrete
-// message. The result contains only field names, expected JSON types, and byte
-// offsets — never body values — so it can be exposed to clients and written to
-// logs without leaking prompts, messages, or credentials.
-func anthropicDecodeError(err error) string {
+// jsonDecodeError renders a JSON decode failure as a safe, concrete message.
+// The result contains only field names, expected JSON types, and byte offsets
+// — never body values — so it can be exposed to clients and written to logs
+// without leaking prompts, messages, or credentials.
+func jsonDecodeError(err error) string {
 	if errors.Is(err, io.EOF) {
 		return "request body is empty"
 	}
