@@ -21,8 +21,9 @@ func TestAnthropicImageBlockBecomesAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chat.Attachments) != 1 || chat.Attachments[0].MIMEType != "image/png" || len(chat.Attachments[0].Data) != 3 {
-		t.Fatalf("attachments=%#v", chat.Attachments)
+	if len(chat.Messages) != 1 || len(chat.Messages[0].Attachments) != 1 ||
+		chat.Messages[0].Attachments[0].MIMEType != "image/png" || len(chat.Messages[0].Attachments[0].Data) != 3 {
+		t.Fatalf("messages=%#v", chat.Messages)
 	}
 	if !strings.Contains(chat.Messages[0].Content, "image attached") {
 		t.Fatalf("content=%q", chat.Messages[0].Content)
@@ -511,5 +512,88 @@ func TestAnthropicRequestIDEchoedAndSanitized(t *testing.T) {
 	}
 	if strings.ContainsAny(got, "\r\n") {
 		t.Fatalf("request id allows header injection: %q", got)
+	}
+}
+
+func TestAnthropicCountTokensRejectsInvalidBodies(t *testing.T) {
+	handler := anthropicTestServer().Handler()
+	cases := []struct{ name, body, want string }{
+		{"top-level null", `null`, "model must not be empty"},
+		{"empty object", `{}`, "model must not be empty"},
+		{"missing messages", `{"model":"m"}`, "messages must not be empty"},
+		{"null messages", `{"model":"m","messages":null}`, "messages must not be empty"},
+		{"empty messages", `{"model":"m","messages":[]}`, "messages must not be empty"},
+		{"blank model", `{"model":" ","messages":[{"role":"user","content":"hi"}]}`, "model must not be empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(tc.body))
+			req.Header.Set("X-API-Key", "client-key")
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if recorder.Header().Get("X-Request-ID") == "" {
+				t.Fatal("missing X-Request-ID on error response")
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"type":"invalid_request_error"`) {
+				t.Fatalf("error type missing: %s", body)
+			}
+			if !strings.Contains(body, tc.want) {
+				t.Fatalf("body %s does not contain %q", body, tc.want)
+			}
+		})
+	}
+}
+
+func TestAnthropicCountTokensStillEstimatesValidBody(t *testing.T) {
+	handler := anthropicTestServer().Handler()
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens?beta=true", strings.NewReader(claudeCodeRequestBody))
+	req.Header.Set("X-API-Key", "client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]int
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["input_tokens"] <= 0 {
+		t.Fatalf("input_tokens = %#v", response)
+	}
+}
+
+func TestAnthropicCountTokensRejectsInvalidSemantics(t *testing.T) {
+	handler := anthropicTestServer().Handler()
+	cases := []struct{ name, body, want string }{
+		{"illegal role", `{"model":"m","messages":[{"role":"robot","content":"hi"}]}`, `unsupported message role \"robot\"`},
+		{"unknown user content block", `{"model":"m","messages":[{"role":"user","content":[{"type":"mystery","x":1}]}]}`, `unsupported user content block \"mystery\"`},
+		{"unknown assistant content block", `{"model":"m","messages":[{"role":"assistant","content":[{"type":"mystery"}]}]}`, `unsupported assistant content block \"mystery\"`},
+		{"empty tool name", `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"name":" ","input_schema":{"type":"object"}}]}`, "tool name must not be empty"},
+		{"invalid image data", `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"!!!"}}]}]}`, "decode image data"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(tc.body))
+			req.Header.Set("X-API-Key", "client-key")
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if recorder.Header().Get("X-Request-ID") == "" {
+				t.Fatal("missing X-Request-ID on error response")
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"type":"invalid_request_error"`) {
+				t.Fatalf("error type missing: %s", body)
+			}
+			if !strings.Contains(body, tc.want) {
+				t.Fatalf("body %s does not contain %q", body, tc.want)
+			}
+		})
 	}
 }

@@ -166,6 +166,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if s.gw == nil {
+		writeErr(w, http.StatusServiceUnavailable, "gateway is not configured")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Upstream.PollTimeout+30*time.Second)
 	defer cancel()
@@ -240,8 +244,9 @@ func (r responsesRequest) chatRequest(todoID string) (openai.ChatRequest, map[st
 				if err != nil {
 					return openai.ChatRequest{}, nil, fmt.Errorf("invalid message content: %w", err)
 				}
-				chat.Attachments = append(chat.Attachments, attachments...)
-				chat.Messages = append(chat.Messages, openai.ChatMessage{Role: role, Content: text})
+				chat.Messages = append(chat.Messages, openai.ChatMessage{
+					Role: role, Content: text, Attachments: attachments,
+				})
 			case "agent_message":
 				text, err := responsesAgentMessageText(item.Content)
 				if err != nil {

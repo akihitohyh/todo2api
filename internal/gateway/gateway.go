@@ -209,7 +209,10 @@ func (g *Gateway) complete(ctx context.Context, req openai.ChatRequest, emit fun
 		if content == "" {
 			return nil, fmt.Errorf("resumed request has no new user or tool-result messages")
 		}
-		attachments, err := registerAttachments(runCtx, runtime.Client, req.Attachments, todoID)
+		// Only the follow-up turn's attachments are re-uploaded: everything
+		// before the last assistant was already registered when the
+		// conversation was created.
+		attachments, err := registerAttachments(runCtx, runtime.Client, followUpAttachments(req.Messages), todoID)
 		if err != nil {
 			return nil, err
 		}
@@ -313,7 +316,9 @@ func (g *Gateway) startNewConversation(
 		sub, err := runtime.Client.PrepareSubscription(ctx)
 		if err == nil {
 			agent, filteredTools := g.accountRequestSettings(runtime, runnerModel, req)
-			attachments, uploadErr := registerAttachments(ctx, runtime.Client, req.Attachments, "")
+			// A new conversation carries the full history, so every message's
+			// attachments must be registered.
+			attachments, uploadErr := registerAttachments(ctx, runtime.Client, allAttachments(req.Messages), "")
 			if uploadErr != nil {
 				err = uploadErr
 			} else {
@@ -540,20 +545,65 @@ func (g *Gateway) sessionEntry(req openai.ChatRequest) (session.Entry, bool) {
 }
 
 func followUpBody(msgs []openai.ChatMessage) string {
-	if len(openai.LastToolResults(msgs)) > 0 {
-		return openai.FormatToolResults(msgs)
-	}
-	start := 0
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == "assistant" {
-			start = i + 1
-			break
-		}
-	}
-	if start >= len(msgs) {
+	turn := followUpMessages(msgs)
+	if len(turn) == 0 {
 		return ""
 	}
-	return openai.FlattenTurn(msgs[start:])
+	if allToolMessages(turn) {
+		// The turn is a pure tool-result follow-up: render it with the full
+		// history so tool names are recovered from the preceding assistant
+		// tool_calls.
+		return openai.FormatToolResults(msgs)
+	}
+	// A mixed turn (user content/images plus tool results) must keep all of
+	// it; sending only the trailing tool results would drop this turn's user
+	// message and image placeholders.
+	return openai.FlattenTurn(turn)
+}
+
+// followUpMessages returns the current follow-up turn: everything after the
+// last assistant message, or the whole request when the history has no
+// assistant yet (an explicit-todo resume). Tool results that trail a user
+// message belong to the same turn and are kept together with it.
+func followUpMessages(msgs []openai.ChatMessage) []openai.ChatMessage {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			return msgs[i+1:]
+		}
+	}
+	return msgs
+}
+
+// allToolMessages reports whether every message in the turn is a tool result.
+func allToolMessages(msgs []openai.ChatMessage) bool {
+	for _, m := range msgs {
+		if m.Role != "tool" {
+			return false
+		}
+	}
+	return true
+}
+
+// followUpAttachments returns the attachments introduced by the current
+// follow-up turn only. Historical messages (up to and including the last
+// assistant message) already had their attachments registered when the
+// conversation was created.
+func followUpAttachments(msgs []openai.ChatMessage) []openai.AttachmentInput {
+	var out []openai.AttachmentInput
+	for _, m := range followUpMessages(msgs) {
+		out = append(out, m.Attachments...)
+	}
+	return out
+}
+
+// allAttachments returns every message's attachments; used when starting a new
+// conversation whose history must be preserved in full.
+func allAttachments(msgs []openai.ChatMessage) []openai.AttachmentInput {
+	var out []openai.AttachmentInput
+	for _, m := range msgs {
+		out = append(out, m.Attachments...)
+	}
+	return out
 }
 
 type frontendPayload struct {
@@ -756,11 +806,60 @@ func conversationKeyWith(system string, msgs []openai.ChatMessage, assistant ope
 	return hashConversation(system, extended)
 }
 
+// hashableMessage is the stable, explicit view of a ChatMessage fed into the
+// conversation hash. Field tags mirror ChatMessage exactly (including the
+// non-omitempty content), so attachment-free histories hash identically to the
+// legacy algorithm that marshaled ChatMessage directly.
+type hashableMessage struct {
+	Role        string               `json:"role"`
+	Content     string               `json:"content"`
+	ToolCalls   []openai.ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID  string               `json:"tool_call_id,omitempty"`
+	Name        string               `json:"name,omitempty"`
+	Attachments []hashableAttachment `json:"attachments,omitempty"`
+}
+
+// hashableAttachment is the digest view of an attachment in the conversation
+// hash. Raw bytes are never marshaled into the hash input; only the SHA-256
+// digest is, so histories that differ only in image data still produce
+// different continuation keys.
+type hashableAttachment struct {
+	Name       string `json:"name"`
+	MIMEType   string `json:"mime_type,omitempty"`
+	DataDigest string `json:"data_digest"`
+}
+
+func hashableMessages(msgs []openai.ChatMessage) []hashableMessage {
+	out := make([]hashableMessage, len(msgs))
+	for i, m := range msgs {
+		out[i] = hashableMessage{
+			Role: m.Role, Content: m.Content, ToolCalls: m.ToolCalls,
+			ToolCallID: m.ToolCallID, Name: m.Name,
+			Attachments: hashableAttachments(m.Attachments),
+		}
+	}
+	return out
+}
+
+func hashableAttachments(atts []openai.AttachmentInput) []hashableAttachment {
+	if len(atts) == 0 {
+		return nil
+	}
+	out := make([]hashableAttachment, len(atts))
+	for i, a := range atts {
+		sum := sha256.Sum256(a.Data)
+		out[i] = hashableAttachment{
+			Name: a.Name, MIMEType: a.MIMEType, DataDigest: hex.EncodeToString(sum[:]),
+		}
+	}
+	return out
+}
+
 func hashConversation(system string, msgs []openai.ChatMessage) string {
 	data, _ := json.Marshal(struct {
-		System   string               `json:"system,omitempty"`
-		Messages []openai.ChatMessage `json:"messages"`
-	}{System: system, Messages: msgs})
+		System   string            `json:"system,omitempty"`
+		Messages []hashableMessage `json:"messages"`
+	}{System: system, Messages: hashableMessages(msgs)})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }

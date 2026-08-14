@@ -14,7 +14,6 @@ type ChatRequest struct {
 	Tools         []Tool            `json:"tools,omitempty"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
 	System        string            `json:"system,omitempty"` // Anthropic-style system parameter
-	Attachments   []AttachmentInput `json:"-"`
 }
 
 // AttachmentInput contains binary data extracted from a multimodal request.
@@ -48,9 +47,15 @@ type ChatMessage struct {
 	// For role == "tool": which call this result answers.
 	ToolCallID string `json:"tool_call_id,omitempty"`
 	Name       string `json:"name,omitempty"`
+	// Attachments carries the images this message introduced. Keeping them on
+	// the message (instead of flattened on ChatRequest) preserves which turn
+	// they belong to, so a resumed session can re-upload only the follow-up
+	// turn's images while a new session keeps the full history. Never
+	// serialized back out.
+	Attachments []AttachmentInput `json:"-"`
 	// Parts holds the raw OpenAI content parts when the request used the array
 	// content form. The transport layer renders them into Content text and
-	// request attachments; it is never serialized back out.
+	// Attachments; it is never serialized back out.
 	Parts []ContentPart `json:"-"`
 }
 
@@ -61,12 +66,18 @@ type ContentPart struct {
 	Type     string          `json:"type"`
 	Text     string          `json:"text,omitempty"`
 	ImageURL json.RawMessage `json:"image_url,omitempty"`
+	// ImageURLCompat is the common camelCase client variant, mirroring the
+	// responses endpoint.
+	ImageURLCompat json.RawMessage `json:"imageUrl,omitempty"`
 }
 
 // UnmarshalJSON accepts both plain string content and the OpenAI content-parts
-// array form. String content is kept as-is; array content is retained in Parts
-// for the transport layer to render (text joins, image attachments).
+// array form. String content is kept as-is; array content is validated and
+// retained in Parts for the transport layer to render (text joins, image
+// attachments). The receiver is cleared first so reusing a ChatMessage value
+// never carries stale Content, Parts, or attachments across decodes.
 func (m *ChatMessage) UnmarshalJSON(data []byte) error {
+	*m = ChatMessage{}
 	var raw struct {
 		Role       string          `json:"role"`
 		Content    json.RawMessage `json:"content"`
@@ -91,7 +102,30 @@ func (m *ChatMessage) UnmarshalJSON(data []byte) error {
 	if content[0] != '[' {
 		return fmt.Errorf("content must be a string or an array of content parts")
 	}
-	return json.Unmarshal(content, &m.Parts)
+	var parts []ContentPart
+	if err := json.Unmarshal(content, &parts); err != nil {
+		return err
+	}
+	if len(parts) == 0 {
+		return fmt.Errorf("content array must not be empty")
+	}
+	for i, part := range parts {
+		switch part.Type {
+		case "text", "input_text", "image_url":
+			// Value-level validation happens during rendering.
+		case "":
+			// A missing type is tolerated only for plain text parts with an
+			// explicit text field; everything else is rejected instead of
+			// being silently dropped.
+			if part.Text == "" {
+				return fmt.Errorf("content part %d has no type and no text", i)
+			}
+		default:
+			return fmt.Errorf("unsupported content part type %q", part.Type)
+		}
+	}
+	m.Parts = parts
+	return nil
 }
 
 type ToolCall struct {

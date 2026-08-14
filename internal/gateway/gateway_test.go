@@ -2,8 +2,11 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -183,19 +186,20 @@ type mockUpstream struct {
 	t      *testing.T
 	server *httptest.Server
 
-	mu                sync.Mutex
-	sockets           map[string]*websocket.Conn
-	createCount       int
-	createBody        map[string]any
-	addBodies         []map[string]any
-	subscriptionCount int
-	assistantContent  string
-	prematureFetch    bool
-	streamFragments   []string
-	streamDelay       time.Duration
-	beforeReady       chan struct{}
-	createFailures    map[string]bool
-	createAttempts    map[string]int
+	mu                      sync.Mutex
+	sockets                 map[string]*websocket.Conn
+	createCount             int
+	createBody              map[string]any
+	addBodies               []map[string]any
+	subscriptionCount       int
+	assistantContent        string
+	prematureFetch          bool
+	streamFragments         []string
+	streamDelay             time.Duration
+	beforeReady             chan struct{}
+	createFailures          map[string]bool
+	createAttempts          map[string]int
+	attachmentRegistrations int
 }
 
 func newMockUpstream(t *testing.T) *mockUpstream {
@@ -218,6 +222,17 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 		m.mu.Lock()
 		m.sockets[r.URL.Query().Get("tabId")] = conn
 		m.mu.Unlock()
+	})
+	mux.HandleFunc("/api/v1/resources/register", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.attachmentRegistrations++
+		id := fmt.Sprintf("att-%d", m.attachmentRegistrations)
+		m.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": id, "uri": "file://" + id, "originalName": "attachment",
+			"mimeType": "application/octet-stream", "fileSize": 1, "createdAt": 1,
+			"isPublic": false, "status": "ok",
+		})
 	})
 	mux.HandleFunc("/api/v1/agents", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]map[string]any{{
@@ -832,5 +847,255 @@ func TestConfiguredAliasOverridesImplicitDefaultShortName(t *testing.T) {
 	}
 	if got := gw.publicModelID("openai:openai/gpt-5.6-sol", "openai:openai/gpt-5.6-sol"); got != "gpt-5.6-sol" {
 		t.Fatalf("public compatibility model = %q", got)
+	}
+}
+
+func TestResumeDoesNotReuploadHistoricalAttachments(t *testing.T) {
+	mock := newMockUpstream(t)
+	gw := newTestGateway(t, mock)
+	imgA := openai.AttachmentInput{Name: "a.png", MIMEType: "image/png", Data: []byte("AAA")}
+	imgB := openai.AttachmentInput{Name: "b.png", MIMEType: "image/png", Data: []byte("BBB")}
+
+	first, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model:    "public-model",
+		Messages: []openai.ChatMessage{{Role: "user", Content: "look at this", Attachments: []openai.AttachmentInput{imgA}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.IsToolCall() {
+		t.Fatalf("first reply = %#v", first)
+	}
+
+	if _, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model: "public-model",
+		Messages: []openai.ChatMessage{
+			{Role: "user", Content: "look at this", Attachments: []openai.AttachmentInput{imgA}},
+			{Role: "assistant", Content: first.Content, ToolCalls: first.ToolCalls},
+			{Role: "user", Content: "now what about this one", Attachments: []openai.AttachmentInput{imgB}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if created := mock.createBody["attachments"].([]any); len(created) != 1 {
+		t.Fatalf("create attachments = %#v, want 1", created)
+	}
+	if len(mock.addBodies) != 1 {
+		t.Fatalf("add bodies = %#v, want 1 resumed turn", mock.addBodies)
+	}
+	if added := mock.addBodies[0]["attachments"].([]any); len(added) != 1 {
+		t.Fatalf("resume attachments = %#v, want only the follow-up image", added)
+	}
+	if mock.attachmentRegistrations != 2 {
+		t.Fatalf("attachment registrations = %d, want 2 (the historical image must not be re-uploaded)", mock.attachmentRegistrations)
+	}
+}
+
+func TestNewConversationRegistersFullHistoryAttachments(t *testing.T) {
+	mock := newMockUpstream(t)
+	gw := newTestGateway(t, mock)
+	imgA := openai.AttachmentInput{Name: "a.png", MIMEType: "image/png", Data: []byte("AAA")}
+	imgB := openai.AttachmentInput{Name: "b.png", MIMEType: "image/png", Data: []byte("BBB")}
+
+	if _, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model: "public-model",
+		Messages: []openai.ChatMessage{
+			{Role: "user", Content: "first", Attachments: []openai.AttachmentInput{imgA}},
+			{Role: "user", Content: "second", Attachments: []openai.AttachmentInput{imgB}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.createCount != 1 {
+		t.Fatalf("create count = %d", mock.createCount)
+	}
+	if created := mock.createBody["attachments"].([]any); len(created) != 2 {
+		t.Fatalf("create attachments = %#v, want both history images", created)
+	}
+	if mock.attachmentRegistrations != 2 {
+		t.Fatalf("attachment registrations = %d, want 2", mock.attachmentRegistrations)
+	}
+}
+
+func TestConversationHashDistinguishesImageData(t *testing.T) {
+	mock := newMockUpstream(t)
+	gw := newTestGateway(t, mock)
+	imgA := openai.AttachmentInput{Name: "a.png", MIMEType: "image/png", Data: []byte("AAA")}
+	imgB := openai.AttachmentInput{Name: "a.png", MIMEType: "image/png", Data: []byte("BBB")}
+	first, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model:    "public-model",
+		Messages: []openai.ChatMessage{{Role: "user", Content: "what is this?", Attachments: []openai.AttachmentInput{imgA}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(attachments []openai.AttachmentInput) openai.ChatRequest {
+		return openai.ChatRequest{
+			Model: "public-model",
+			Messages: []openai.ChatMessage{
+				{Role: "user", Content: "what is this?", Attachments: attachments},
+				{Role: "assistant", Content: first.Content, ToolCalls: first.ToolCalls},
+				{Role: "user", Content: "continue"},
+			},
+		}
+	}
+
+	// Same text and same image resume the same todo.
+	if _, err := gw.Complete(context.Background(), request([]openai.AttachmentInput{imgA})); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same text, different image bytes must start a new conversation.
+	if _, err := gw.Complete(context.Background(), request([]openai.AttachmentInput{imgB})); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same text, no image is also a different history.
+	if _, err := gw.Complete(context.Background(), request(nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.createCount != 3 {
+		t.Fatalf("create count = %d, want 3 (two histories that differ only in image data must not resume)", mock.createCount)
+	}
+	if len(mock.addBodies) != 1 {
+		t.Fatalf("resumed turns = %d, want 1", len(mock.addBodies))
+	}
+}
+
+func TestHashConversationIncludesAttachments(t *testing.T) {
+	base := []openai.ChatMessage{{Role: "user", Content: "what is this?"}}
+	withA := append([]openai.ChatMessage(nil), base...)
+	withA[0].Attachments = []openai.AttachmentInput{{Name: "a.png", MIMEType: "image/png", Data: []byte("AAA")}}
+	withB := append([]openai.ChatMessage(nil), base...)
+	withB[0].Attachments = []openai.AttachmentInput{{Name: "a.png", MIMEType: "image/png", Data: []byte("BBB")}}
+
+	if hashConversation("", base) == hashConversation("", withA) {
+		t.Fatal("attachment-bearing history hashed identically to text-only history")
+	}
+	if hashConversation("", withA) == hashConversation("", withB) {
+		t.Fatal("different image bytes produced the same conversation key")
+	}
+	if hashConversation("", withA) != hashConversation("", withA) {
+		t.Fatal("conversation hash is not deterministic")
+	}
+}
+
+func TestFollowUpAttachmentsOnlyIncludeFollowUpTurn(t *testing.T) {
+	msgs := []openai.ChatMessage{
+		{Role: "user", Content: "history", Attachments: []openai.AttachmentInput{{Name: "old.png"}}},
+		{Role: "assistant", Content: "ok"},
+		{Role: "user", Content: "follow up", Attachments: []openai.AttachmentInput{{Name: "new.png"}}},
+	}
+	got := followUpAttachments(msgs)
+	if len(got) != 1 || got[0].Name != "new.png" {
+		t.Fatalf("follow-up attachments = %#v, want only new.png", got)
+	}
+}
+
+// legacyConversationHash reproduces the pre-attachment hash algorithm: the
+// SHA-256 of ChatMessage JSON, which serializes Role/Content/ToolCalls/
+// ToolCallID/Name and never attachments.
+func legacyConversationHash(system string, msgs []openai.ChatMessage) string {
+	data, _ := json.Marshal(struct {
+		System   string               `json:"system,omitempty"`
+		Messages []openai.ChatMessage `json:"messages"`
+	}{System: system, Messages: msgs})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func TestHashConversationMatchesLegacyFormat(t *testing.T) {
+	textHistory := []openai.ChatMessage{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "hi there"},
+	}
+	if got, want := hashConversation("system prompt", textHistory), legacyConversationHash("system prompt", textHistory); got != want {
+		t.Fatalf("plain text history hash diverged from legacy: %s != %s", got, want)
+	}
+
+	// Assistant tool-call turns serialize Content as an empty string, which
+	// must still match the legacy representation byte for byte.
+	toolHistory := []openai.ChatMessage{
+		{Role: "user", Content: "read a.txt"},
+		{Role: "assistant", Content: "", ToolCalls: []openai.ToolCall{{
+			ID: "call-1", Type: "function",
+			Function: openai.FunctionCall{Name: "read", Arguments: `{}`},
+		}}},
+	}
+	if got, want := hashConversation("", toolHistory), legacyConversationHash("", toolHistory); got != want {
+		t.Fatalf("tool-call history hash diverged from legacy: %s != %s", got, want)
+	}
+
+	// An attachment-bearing history intentionally diverges from the legacy
+	// hash (which ignored attachments entirely), so different image data can
+	// never share a continuation key.
+	withAttachment := append([]openai.ChatMessage(nil), textHistory...)
+	withAttachment[0].Attachments = []openai.AttachmentInput{{Name: "a.png", MIMEType: "image/png", Data: []byte("AAA")}}
+	if got, want := hashConversation("system prompt", withAttachment), legacyConversationHash("system prompt", textHistory); got == want {
+		t.Fatal("attachment-bearing history hashed identically to the legacy (attachment-free) representation")
+	}
+}
+
+func TestResumeUploadsMixedTurnAttachments(t *testing.T) {
+	// A resumed turn that mixes a user message with a new image and a trailing
+	// tool result must upload only the new image and send both the user
+	// content and the tool result, never the historical image.
+	mock := newMockUpstream(t)
+	gw := newTestGateway(t, mock)
+	oldImg := openai.AttachmentInput{Name: "old.png", MIMEType: "image/png", Data: []byte("OLD")}
+	newImg := openai.AttachmentInput{Name: "new.png", MIMEType: "image/png", Data: []byte("NEW")}
+
+	first, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model:    "public-model",
+		Messages: []openai.ChatMessage{{Role: "user", Content: "look at this", Attachments: []openai.AttachmentInput{oldImg}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.IsToolCall() {
+		t.Fatalf("first reply = %#v", first)
+	}
+
+	if _, err := gw.Complete(context.Background(), openai.ChatRequest{
+		Model: "public-model",
+		Messages: []openai.ChatMessage{
+			{Role: "user", Content: "look at this", Attachments: []openai.AttachmentInput{oldImg}},
+			{Role: "assistant", Content: first.Content, ToolCalls: first.ToolCalls},
+			{Role: "user", Content: "now this one", Attachments: []openai.AttachmentInput{newImg}},
+			{Role: "tool", ToolCallID: first.ToolCalls[0].ID, Name: "read_file", Content: "the file says ok"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.attachmentRegistrations != 2 {
+		t.Fatalf("attachment registrations = %d, want 2 (old image once at create, new image once at resume)", mock.attachmentRegistrations)
+	}
+	if created := mock.createBody["attachments"].([]any); len(created) != 1 {
+		t.Fatalf("create attachments = %#v, want the historical image", created)
+	}
+	if len(mock.addBodies) != 1 {
+		t.Fatalf("add bodies = %#v, want 1 resumed turn", mock.addBodies)
+	}
+	added := mock.addBodies[0]
+	if atts := added["attachments"].([]any); len(atts) != 1 {
+		t.Fatalf("resume attachments = %#v, want only the new image", atts)
+	}
+	content, _ := added["content"].(string)
+	for _, want := range []string{"now this one", "the file says ok"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("resume content %q does not contain %q", content, want)
+		}
 	}
 }

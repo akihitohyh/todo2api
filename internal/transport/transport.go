@@ -18,13 +18,29 @@ import (
 
 type Server struct {
 	cfg *config.Config
-	gw  *gateway.Gateway
+	gw  gatewayClient
+}
+
+// gatewayClient is the subset of *gateway.Gateway the HTTP layer depends on.
+// Keeping it an interface lets tests observe what the handlers pass to the
+// gateway without standing up an upstream.
+type gatewayClient interface {
+	Complete(ctx context.Context, req openai.ChatRequest) (*gateway.Reply, error)
+	Stream(ctx context.Context, req openai.ChatRequest, emit func(gateway.StreamEvent) error) (*gateway.Reply, error)
+	Models() []openai.Model
 }
 
 const todoIDHeader = "X-Todo2API-Todo-ID"
 
 func New(cfg *config.Config, gw *gateway.Gateway) *Server {
-	return &Server{cfg: cfg, gw: gw}
+	// A nil *gateway.Gateway must not be stored as a typed nil inside the
+	// gatewayClient interface: s.gw != nil would then be true and the config
+	// model fallback would never run.
+	var client gatewayClient
+	if gw != nil {
+		client = gw
+	}
+	return &Server{cfg: cfg, gw: client}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -116,6 +132,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	requestID := anthropicRequestID(r)
+	w.Header().Set("X-Request-ID", requestID)
 	var req openai.ChatRequest
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -136,7 +154,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		message.Content = text
-		req.Attachments = append(req.Attachments, attachments...)
+		message.Attachments = attachments
+	}
+	if s.gw == nil {
+		writeErr(w, http.StatusServiceUnavailable, "gateway is not configured")
+		return
 	}
 	if todoID := strings.TrimSpace(r.Header.Get(todoIDHeader)); todoID != "" {
 		if req.Metadata == nil {
@@ -167,18 +189,28 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, buildResponse(reply))
 }
 
-// chatContentParts renders OpenAI content parts into message text and request
+// chatContentParts renders OpenAI content parts into message text and
 // attachments. Text parts are joined with blank lines; image_url parts become
 // base64 attachments (or an inline note when the URL is remote), mirroring
-// responsesInputContent for the chat completions endpoint.
+// responsesInputContent for the chat completions endpoint. A part without a
+// type is accepted only when it carries an explicit text field; everything
+// else is rejected instead of being silently dropped.
 func chatContentParts(parts []openai.ContentPart) (string, []openai.AttachmentInput, error) {
 	var text strings.Builder
 	var attachments []openai.AttachmentInput
 	for _, part := range parts {
 		switch part.Type {
-		case "text", "input_text", "":
+		case "text", "input_text":
 			if part.Text == "" {
-				continue
+				return "", nil, fmt.Errorf("content part of type %q has no text", part.Type)
+			}
+			if text.Len() > 0 {
+				text.WriteString("\n\n")
+			}
+			text.WriteString(part.Text)
+		case "":
+			if part.Text == "" {
+				return "", nil, fmt.Errorf("content part has no type and no text")
 			}
 			if text.Len() > 0 {
 				text.WriteString("\n\n")
@@ -211,6 +243,9 @@ func chatContentParts(parts []openai.ContentPart) (string, []openai.AttachmentIn
 // attachment, mirroring responsesImageAttachment for chat requests.
 func chatImageAttachment(part openai.ContentPart, index int) (*openai.AttachmentInput, string, error) {
 	source := bytes.TrimSpace(part.ImageURL)
+	if len(source) == 0 || bytes.Equal(source, []byte("null")) {
+		source = bytes.TrimSpace(part.ImageURLCompat)
+	}
 	if len(source) == 0 || bytes.Equal(source, []byte("null")) {
 		return nil, "", fmt.Errorf("image_url part requires an image_url value")
 	}

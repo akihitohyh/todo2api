@@ -1,11 +1,13 @@
 package transport
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"todo2api/internal/config"
@@ -370,4 +372,421 @@ func decodeChatChunks(t *testing.T, body string) []openai.ChatResponse {
 		chunks = append(chunks, chunk)
 	}
 	return chunks
+}
+
+// recordingGateway captures the ChatRequest handlers pass to the gateway so
+// tests can observe the transport→gateway wiring without an upstream.
+type recordingGateway struct {
+	mu    sync.Mutex
+	last  openai.ChatRequest
+	reply *gateway.Reply
+	err   error
+}
+
+func (g *recordingGateway) Complete(_ context.Context, req openai.ChatRequest) (*gateway.Reply, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.last = req
+	return g.reply, g.err
+}
+
+func (g *recordingGateway) Stream(context.Context, openai.ChatRequest, func(gateway.StreamEvent) error) (*gateway.Reply, error) {
+	return g.reply, g.err
+}
+
+func (g *recordingGateway) Models() []openai.Model { return nil }
+
+func (g *recordingGateway) lastRequest() openai.ChatRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.last
+}
+
+func TestChatCompletionsWiresPartsIntoMessage(t *testing.T) {
+	gw := &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "claude-opus-5", TodoID: "todo-1"}}
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  gw,
+	}).Handler()
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"claude-opus-5",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"see this"},
+			{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
+			{"type":"text","text":"and this"}
+		]}]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	got := gw.lastRequest()
+	if len(got.Messages) != 1 {
+		t.Fatalf("messages = %#v", got.Messages)
+	}
+	message := got.Messages[0]
+	if message.Content != "see this\n\n[image attached: image-1.png]\n\nand this" {
+		t.Fatalf("content = %q", message.Content)
+	}
+	if len(message.Attachments) != 1 || message.Attachments[0].MIMEType != "image/png" || len(message.Attachments[0].Data) != 3 {
+		t.Fatalf("attachments = %#v", message.Attachments)
+	}
+}
+
+func TestChatCompletionsCamelCaseImageUrlWiresAttachment(t *testing.T) {
+	gw := &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "m", TodoID: "todo-1"}}
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  gw,
+	}).Handler()
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"m",
+		"messages":[{"role":"user","content":[
+			{"type":"image_url","imageUrl":{"url":"data:image/png;base64,AAAA"}}
+		]}]
+	}`))
+	req.Header.Set("X-API-Key", "client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	attachments := gw.lastRequest().Messages[0].Attachments
+	if len(attachments) != 1 || attachments[0].MIMEType != "image/png" || len(attachments[0].Data) != 3 {
+		t.Fatalf("attachments = %#v", attachments)
+	}
+}
+
+func TestChatCompletionsRejectsInvalidContentParts(t *testing.T) {
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "m", TodoID: "todo-1"}},
+	}).Handler()
+	cases := []struct{ name, part, want string }{
+		{"no type no text", `{"foo":"bar"}`, "content part 0 has no type and no text"},
+		{"empty object", `{}`, "content part 0 has no type and no text"},
+		{"unknown type", `{"type":"audio"}`, `unsupported content part type \"audio\"`},
+		{"text without text", `{"type":"text"}`, `content part of type \"text\" has no text`},
+		{"input_text without text", `{"type":"input_text","text":""}`, `content part of type \"input_text\" has no text`},
+		{"image without url", `{"type":"image_url"}`, "image_url part requires an image_url value"},
+		{"invalid image url", `{"type":"image_url","image_url":{"url":123}}`, "invalid image_url"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+				`{"model":"m","messages":[{"role":"user","content":[`+tc.part+`]}]}`,
+			))
+			req.Header.Set("Authorization", "Bearer client-key")
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if recorder.Header().Get("X-Request-ID") == "" {
+				t.Fatal("missing X-Request-ID on error response")
+			}
+			if !strings.Contains(recorder.Body.String(), tc.want) {
+				t.Fatalf("body %s does not contain %q", recorder.Body.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestAnthropicWiresImagesPerMessage(t *testing.T) {
+	gw := &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "m", TodoID: "todo-1"}}
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  gw,
+	}).Handler()
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"m",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"describe this"},
+			{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+		]}]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	got := gw.lastRequest()
+	if len(got.Messages) != 1 {
+		t.Fatalf("messages = %#v", got.Messages)
+	}
+	message := got.Messages[0]
+	if !strings.Contains(message.Content, "describe this") || !strings.Contains(message.Content, "[image attached: image.png]") {
+		t.Fatalf("content = %q", message.Content)
+	}
+	if len(message.Attachments) != 1 || message.Attachments[0].MIMEType != "image/png" || len(message.Attachments[0].Data) != 3 {
+		t.Fatalf("attachments = %#v", message.Attachments)
+	}
+}
+
+func TestResponsesWiresImagesPerMessage(t *testing.T) {
+	gw := &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "m", TodoID: "todo-1"}}
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  gw,
+	}).Handler()
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"m",
+		"input":[
+			{"type":"message","role":"user","content":[
+				{"type":"input_text","text":"see this"},
+				{"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+			]}
+		]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	got := gw.lastRequest()
+	if len(got.Messages) != 1 {
+		t.Fatalf("messages = %#v", got.Messages)
+	}
+	message := got.Messages[0]
+	if !strings.Contains(message.Content, "see this") || !strings.Contains(message.Content, "[image attached: image-1.png]") {
+		t.Fatalf("content = %q", message.Content)
+	}
+	if len(message.Attachments) != 1 || message.Attachments[0].MIMEType != "image/png" || len(message.Attachments[0].Data) != 3 {
+		t.Fatalf("attachments = %#v", message.Attachments)
+	}
+}
+
+func TestChatCompletionsAcceptsMissingTypeTextPart(t *testing.T) {
+	gw := &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "m", TodoID: "todo-1"}}
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  gw,
+	}).Handler()
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"m",
+		"messages":[{"role":"user","content":[{"text":"bare text part"}]}]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if got := gw.lastRequest().Messages[0].Content; got != "bare text part" {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+func TestNewWithNilGatewayUsesConfigModels(t *testing.T) {
+	s := New(&config.Config{Models: config.ModelsConfig{
+		Default: "model-default",
+		Aliases: map[string]string{"model-a": "upstream-a", "model-z": "upstream-z"},
+	}}, nil)
+	recorder := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var list openai.ModelList
+	if err := json.NewDecoder(recorder.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, model := range list.Data {
+		seen[model.ID] = true
+	}
+	for _, id := range []string{"model-a", "model-default", "model-z"} {
+		if !seen[id] {
+			t.Fatalf("models = %#v, missing %q", list.Data, id)
+		}
+	}
+}
+
+func TestAnthropicHistoryConversionWiresImageAndToolResult(t *testing.T) {
+	gw := &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "m", TodoID: "todo-1"}}
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  gw,
+	}).Handler()
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"m",
+		"messages":[
+			{"role":"user","content":[
+				{"type":"text","text":"history context"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+			]},
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"a.txt"}}
+			]},
+			{"role":"user","content":[
+				{"type":"text","text":"look at this"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
+				{"type":"tool_result","tool_use_id":"toolu_1","content":"file contents"}
+			]}
+		]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	messages := gw.lastRequest().Messages
+	if len(messages) != 4 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	if messages[0].Role != "user" || !strings.Contains(messages[0].Content, "history context") ||
+		!strings.Contains(messages[0].Content, "[image attached: image.png]") ||
+		len(messages[0].Attachments) != 1 || messages[0].Attachments[0].MIMEType != "image/png" {
+		t.Fatalf("history user message = %#v", messages[0])
+	}
+	if messages[1].Role != "assistant" || len(messages[1].ToolCalls) != 1 ||
+		messages[1].ToolCalls[0].ID != "toolu_1" || messages[1].ToolCalls[0].Function.Name != "read_file" ||
+		messages[1].ToolCalls[0].Function.Arguments != `{"path":"a.txt"}` {
+		t.Fatalf("assistant message = %#v", messages[1])
+	}
+	if messages[2].Role != "user" || !strings.Contains(messages[2].Content, "look at this") ||
+		!strings.Contains(messages[2].Content, "[image attached: image.png]") ||
+		len(messages[2].Attachments) != 1 || len(messages[2].Attachments[0].Data) != 3 {
+		t.Fatalf("current user message = %#v", messages[2])
+	}
+	if messages[3].Role != "tool" || messages[3].ToolCallID != "toolu_1" ||
+		messages[3].Name != "read_file" || messages[3].Content != "file contents" {
+		t.Fatalf("tool message = %#v", messages[3])
+	}
+}
+
+func TestResponsesHistoryConversionWiresImageAndFunctionCall(t *testing.T) {
+	gw := &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "m", TodoID: "todo-1"}}
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  gw,
+	}).Handler()
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"m",
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a.txt\"}"},
+			{"type":"message","role":"user","content":[
+				{"type":"input_text","text":"look at this"},
+				{"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+			]},
+			{"type":"function_call_output","call_id":"call_1","output":"file contents"}
+		]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	messages := gw.lastRequest().Messages
+	if len(messages) != 3 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	if messages[0].Role != "assistant" || len(messages[0].ToolCalls) != 1 ||
+		messages[0].ToolCalls[0].ID != "call_1" || messages[0].ToolCalls[0].Function.Name != "read_file" ||
+		messages[0].ToolCalls[0].Function.Arguments != `{"path":"a.txt"}` {
+		t.Fatalf("assistant message = %#v", messages[0])
+	}
+	if messages[1].Role != "user" || !strings.Contains(messages[1].Content, "look at this") ||
+		!strings.Contains(messages[1].Content, "[image attached: image-1.png]") ||
+		len(messages[1].Attachments) != 1 || messages[1].Attachments[0].MIMEType != "image/png" {
+		t.Fatalf("current user message = %#v", messages[1])
+	}
+	if messages[2].Role != "tool" || messages[2].ToolCallID != "call_1" ||
+		messages[2].Name != "read_file" || messages[2].Content != "file contents" {
+		t.Fatalf("tool message = %#v", messages[2])
+	}
+}
+
+func TestChatCompletionsRejectsEmptyContentArray(t *testing.T) {
+	handler := (&Server{
+		cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}},
+		gw:  &recordingGateway{reply: &gateway.Reply{Content: "ok", Model: "m", TodoID: "todo-1"}},
+	}).Handler()
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"m",
+		"messages":[{"role":"user","content":[]}]
+	}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("X-Request-ID") == "" {
+		t.Fatal("missing X-Request-ID on error response")
+	}
+	if !strings.Contains(recorder.Body.String(), "content array must not be empty") {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+
+	// Compat regression: string content and content-less assistant tool-call
+	// messages must keep working.
+	for _, body := range []string{
+		`{"model":"m","messages":[{"role":"user","content":"plain string"}]}`,
+		`{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}]}`,
+		`{"model":"m","messages":[{"role":"user","content":null}]}`,
+	} {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("X-API-Key", "client-key")
+		handler.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("body %s: status = %d, response = %s", body, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestNilGatewayEndpoints(t *testing.T) {
+	s := New(&config.Config{}, nil) // no client tokens: auth is disabled
+	handler := s.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d", recorder.Code)
+	}
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("models status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	cases := []struct{ name, path, body string }{
+		{"chat completions", "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`},
+		{"messages", "/v1/messages", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`},
+		{"responses", "/v1/responses", `{"model":"m","input":[{"type":"message","role":"user","content":"hi"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), "gateway is not configured") {
+				t.Fatalf("body = %s", recorder.Body.String())
+			}
+		})
+	}
 }

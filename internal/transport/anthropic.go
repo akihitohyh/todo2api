@@ -305,6 +305,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	if s.gw == nil {
+		writeAnthropicErr(w, http.StatusServiceUnavailable, "api_error", "gateway is not configured")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Upstream.PollTimeout+30*time.Second)
 	defer cancel()
@@ -335,6 +339,15 @@ func (s *Server) handleMessagesCountTokens(w http.ResponseWriter, r *http.Reques
 	req, err := decodeAnthropicRequest(r)
 	if err != nil {
 		writeAnthropicDecodeError(w, r, requestID, err)
+		return
+	}
+	// Reuse the /v1/messages semantic validation: a top-level null, an empty
+	// object, a missing model or messages, an illegal role, an unknown content
+	// block, or an invalid tool/image must all be rejected exactly like
+	// /v1/messages would. chatRequest is a pure conversion — it never touches
+	// the gateway and never uploads attachments.
+	if _, err := req.chatRequest(""); err != nil {
+		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	b, _ := json.Marshal(req)
@@ -399,12 +412,16 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 			chat.Messages = append(chat.Messages, converted)
 		case "user":
 			var text strings.Builder
+			var attachments []openai.AttachmentInput
 			flushText := func() {
-				if text.Len() == 0 {
+				if text.Len() == 0 && len(attachments) == 0 {
 					return
 				}
-				chat.Messages = append(chat.Messages, openai.ChatMessage{Role: "user", Content: text.String()})
+				chat.Messages = append(chat.Messages, openai.ChatMessage{
+					Role: "user", Content: text.String(), Attachments: attachments,
+				})
 				text.Reset()
+				attachments = nil
 			}
 			for _, block := range blocks {
 				switch block.Type {
@@ -415,7 +432,7 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 					if err != nil {
 						return openai.ChatRequest{}, fmt.Errorf("invalid image content: %w", err)
 					}
-					chat.Attachments = append(chat.Attachments, attachment)
+					attachments = append(attachments, attachment)
 					if text.Len() > 0 {
 						text.WriteString("\n\n")
 					}
