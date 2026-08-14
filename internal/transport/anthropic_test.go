@@ -1,9 +1,12 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -269,4 +272,244 @@ func anthropicUsageEvent(t *testing.T, body, eventType string) anthropicUsage {
 	}
 	t.Fatalf("event %q not found in:\n%s", eventType, body)
 	return anthropicUsage{}
+}
+
+// claudeCodeRequestBody mirrors the shape Claude Code 2.1.226 sends to
+// POST /v1/messages?beta=true: system as a block array, default tools with
+// cache_control, and top-level fields this gateway tolerates but does not
+// interpret (tool_choice, thinking, context_management, metadata).
+const claudeCodeRequestBody = `{
+	"model": "claude-sonnet-4-5-20250929",
+	"max_tokens": 32768,
+	"stream": true,
+	"system": [
+		{"type": "text", "text": "You are Claude Code, an expert software engineering agent.", "cache_control": {"type": "ephemeral"}}
+	],
+	"messages": [
+		{"role": "user", "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}]}
+	],
+	"tools": [
+		{"name": "Bash", "description": "Run shell commands", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}, "cache_control": {"type": "ephemeral"}},
+		{"name": "Read", "description": "Read a file", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}},
+		{"name": "Task", "description": "Delegate work to a subagent", "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}}}
+	],
+	"tool_choice": {"type": "auto"},
+	"thinking": {"type": "enabled", "budget_tokens": 1024},
+	"context_management": {"enabled": true, "strategy": "auto"},
+	"metadata": {"user_id": "test-user", "session_id": "sess_123"}
+}`
+
+func anthropicTestServer() *Server {
+	return &Server{cfg: &config.Config{Server: config.ServerConfig{ClientTokens: []string{"client-key"}}}}
+}
+
+func TestAnthropicClaudeCodeRequestDecodes(t *testing.T) {
+	// The real request URL carries ?beta=true; decode must not care.
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages?beta=true", strings.NewReader(claudeCodeRequestBody))
+	req, err := decodeAnthropicRequest(r)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if req.Model != "claude-sonnet-4-5-20250929" {
+		t.Fatalf("model = %q", req.Model)
+	}
+	if req.MaxTokens != 32768 || !req.Stream {
+		t.Fatalf("max_tokens=%d stream=%v", req.MaxTokens, req.Stream)
+	}
+	if len(req.Messages) != 1 {
+		t.Fatalf("messages = %#v", req.Messages)
+	}
+	if len(req.Tools) != 3 {
+		t.Fatalf("tools = %#v", req.Tools)
+	}
+	if len(req.Metadata) != 2 || req.Metadata["user_id"] != "test-user" {
+		t.Fatalf("metadata = %#v", req.Metadata)
+	}
+	if len(bytes.TrimSpace(req.System)) == 0 {
+		t.Fatal("system not decoded")
+	}
+}
+
+func TestAnthropicClaudeCodeRequestOverHTTP(t *testing.T) {
+	handler := anthropicTestServer().Handler()
+	for _, auth := range []struct{ name, header, value string }{
+		{"bearer", "Authorization", "Bearer client-key"},
+		{"api-key", "X-API-Key", "client-key"},
+	} {
+		t.Run(auth.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens?beta=true", strings.NewReader(claudeCodeRequestBody))
+			req.Header.Set(auth.header, auth.value)
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if id := recorder.Header().Get("X-Request-ID"); !strings.HasPrefix(id, "req_") {
+				t.Fatalf("request id = %q", id)
+			}
+			var response map[string]int
+			if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+				t.Fatal(err)
+			}
+			if response["input_tokens"] <= 0 {
+				t.Fatalf("input_tokens = %#v", response)
+			}
+		})
+	}
+}
+
+func TestAnthropicMessagesDecodeErrors(t *testing.T) {
+	handler := anthropicTestServer().Handler()
+	cases := []struct{ name, body, want string }{
+		{"empty body", "", "request body is empty"},
+		{"whitespace only", "  \n\t", "request body is empty"},
+		{"truncated JSON", `{"model":`, "unexpected end of JSON input at byte offset 9"},
+		{"max_tokens wrong type", `{"max_tokens":"4096","model":"m","messages":[{"role":"user","content":"hi"}]}`, "field max_tokens must be a number, got string"},
+		{"messages wrong type", `{"model":"m","messages":{}}`, "field messages must be an array, got object"},
+		{"stream wrong type", `{"model":"m","stream":"yes","messages":[]}`, "field stream must be a boolean, got string"},
+		{"nested role wrong type", `{"model":"m","messages":[{"role":5}]}`, "field messages.role must be a string, got number"},
+		{"top-level array", `[]`, "field request must be an object, got array"},
+		{"multiple JSON values", `{"model":"m"}{"model":"x"}`, "request body contains multiple JSON values"},
+		{"trailing garbage", `{"model":"m"} xyz`, "request body contains trailing data"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages?beta=true", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer client-key")
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if recorder.Header().Get("X-Request-ID") == "" {
+				t.Fatal("missing X-Request-ID on error response")
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"type":"invalid_request_error"`) {
+				t.Fatalf("error type missing: %s", body)
+			}
+			if want := "invalid request body: " + tc.want; !strings.Contains(body, want) {
+				t.Fatalf("body %s does not contain %q", body, want)
+			}
+		})
+	}
+}
+
+func TestAnthropicCountTokensSharesDecodeErrors(t *testing.T) {
+	handler := anthropicTestServer().Handler()
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{"max_tokens":"4096"}`))
+	req.Header.Set("X-API-Key", "client-key")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "invalid request body: field max_tokens must be a number, got string") {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestAnthropicOversizedBodyRejected(t *testing.T) {
+	old := maxAnthropicBodyBytes
+	maxAnthropicBodyBytes = 1024
+	t.Cleanup(func() { maxAnthropicBodyBytes = old })
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(strings.Repeat("x", 1025)))
+	req.Header.Set("Authorization", "Bearer client-key")
+	anthropicTestServer().Handler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "invalid request body: request body exceeds 1 MiB") {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestAnthropicContentEncoding(t *testing.T) {
+	handler := anthropicTestServer().Handler()
+
+	// gzip support is only added once a real failing request confirms it; until
+	// then the encoding must fail with an explicit, actionable error.
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("X-API-Key", "client-key")
+	req.Header.Set("Content-Encoding", "gzip")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `unsupported Content-Encoding \"gzip\"`) {
+		t.Fatalf("gzip: status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-API-Key", "client-key")
+	req.Header.Set("Content-Encoding", "identity")
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("identity: status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestAnthropicDecodeErrorDoesNotLeakBodyOrCredentials(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	handler := anthropicTestServer().Handler()
+	cases := []struct{ name, body, want string }{
+		// Value would leak as "string" or "number 987654321" if printed raw.
+		{"string value", `{"max_tokens":"SK-SECRET-STRING","model":"m"}`, "field max_tokens must be a number, got string"},
+		{"number value", `{"messages":987654321,"model":"m"}`, "field messages must be an array, got number"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer client-key")
+			req.Header.Set("X-API-Key", "client-key")
+			req.Header.Set("X-Request-ID", "req-leak-test")
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), tc.want) {
+				t.Fatalf("response lacks diagnostic %q: %s", tc.want, recorder.Body.String())
+			}
+			for _, secret := range []string{"SK-SECRET-STRING", "987654321", "client-key"} {
+				if strings.Contains(recorder.Body.String(), secret) {
+					t.Fatalf("response leaks %q: %s", secret, recorder.Body.String())
+				}
+			}
+		})
+	}
+
+	logged := logs.String()
+	for _, want := range []string{"req-leak-test", "/v1/messages", "max_tokens", "content-type=", "content-encoding=", "content-length="} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("log lacks %q:\n%s", want, logged)
+		}
+	}
+	for _, secret := range []string{"SK-SECRET-STRING", "987654321", "client-key"} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("log leaks %q:\n%s", secret, logged)
+		}
+	}
+}
+
+func TestAnthropicRequestIDEchoedAndSanitized(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"max_tokens":"x"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Request-ID", "req-123\r\nX-Injected: yes")
+	anthropicTestServer().Handler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	got := recorder.Header().Get("X-Request-ID")
+	if got != "req-123X-Injected: yes" {
+		t.Fatalf("sanitized request id = %q", got)
+	}
+	if strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("request id allows header injection: %q", got)
+	}
 }
