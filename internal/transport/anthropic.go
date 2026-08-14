@@ -3,10 +3,16 @@ package transport
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -77,20 +83,230 @@ type anthropicMessageResponse struct {
 	Usage        anthropicUsage         `json:"usage"`
 }
 
+// maxJSONBodyBytes caps how much of a JSON request body the server will read.
+// It sits above the 20 MiB decoded-image limit so base64 image attachments
+// still fit, while bounding memory use on malformed or hostile input. It is a
+// variable only so tests can exercise the cap cheaply.
+var maxJSONBodyBytes = 64 << 20
+
+// jsonBodyError reports a body decode failure. Error() is always the redacted
+// detail — field names, JSON types, byte offsets — and never contains body
+// values, so it is safe to expose to clients. The underlying error stays
+// reachable through Unwrap for server-side logging.
+type jsonBodyError struct {
+	detail string
+	cause  error
+}
+
+func (e *jsonBodyError) Error() string { return e.detail }
+func (e *jsonBodyError) Unwrap() error { return e.cause }
+
+// decodeAnthropicRequest decodes a Claude Code /v1/messages-style body into an
+// anthropicRequest. /v1/messages and /v1/messages/count_tokens share it so both
+// endpoints reject malformed bodies identically and with the same diagnostics.
+//
+// Unknown top-level fields are deliberately tolerated: Claude Code sends
+// fields this gateway does not interpret (thinking, context_management,
+// tool_choice, cache_control, ...) and rejecting them would break
+// compatibility.
+func decodeAnthropicRequest(r *http.Request) (anthropicRequest, error) {
+	var req anthropicRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		return anthropicRequest{}, err
+	}
+	return req, nil
+}
+
+// decodeJSONBody decodes a JSON request body into target with diagnostics
+// shared by every endpoint: empty bodies, JSON syntax errors, field type
+// mismatches, oversized bodies, and trailing data are distinguished, unknown
+// fields are tolerated, and non-identity Content-Encoding is rejected
+// explicitly. The returned error never contains body values.
+func decodeJSONBody(r *http.Request, target any) error {
+	if encoding := strings.TrimSpace(r.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		return fmt.Errorf("unsupported Content-Encoding %q (only identity is supported)", encoding)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxJSONBodyBytes+1)))
+	if err != nil {
+		return fmt.Errorf("read request body: %w", err)
+	}
+	if len(body) > maxJSONBodyBytes {
+		return fmt.Errorf("request body exceeds %d MiB", (maxJSONBodyBytes+(1<<20)-1)>>20)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(target); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return &jsonBodyError{
+				detail: fmt.Sprintf("unexpected end of JSON input at byte offset %d", len(body)),
+				cause:  err,
+			}
+		}
+		return &jsonBodyError{detail: jsonDecodeError(err), cause: err}
+	}
+	// The body must contain exactly one JSON value: a second successful Decode
+	// means trailing JSON, and any other non-EOF error means trailing garbage.
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body contains multiple JSON values")
+		}
+		return &jsonBodyError{
+			detail: "request body contains trailing data: " + jsonDecodeError(err),
+			cause:  err,
+		}
+	}
+	return nil
+}
+
+// jsonDecodeError renders a JSON decode failure as a safe, concrete message.
+// The result contains only field names, expected JSON types, and byte offsets
+// — never body values — so it can be exposed to clients and written to logs
+// without leaking prompts, messages, or credentials.
+func jsonDecodeError(err error) string {
+	if errors.Is(err, io.EOF) {
+		return "request body is empty"
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		field := typeErr.Field
+		if field == "" {
+			field = "request"
+		}
+		kind := anthropicJSONType(typeErr.Type)
+		article := "a"
+		switch kind[0] {
+		case 'a', 'e', 'i', 'o', 'u':
+			article = "an"
+		}
+		return fmt.Sprintf("field %s must be %s %s, got %s", field, article, kind, anthropicJSONKind(typeErr.Value))
+	}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return fmt.Sprintf("invalid JSON at byte offset %d", syntaxErr.Offset)
+	}
+	return err.Error()
+}
+
+// anthropicJSONType names the JSON type a Go struct field expects, e.g.
+// int -> "number".
+func anthropicJSONType(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.Bool:
+		return "boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return "number"
+	case reflect.String:
+		return "string"
+	case reflect.Slice, reflect.Array:
+		return "array"
+	case reflect.Map, reflect.Struct:
+		return "object"
+	default:
+		return t.String()
+	}
+}
+
+// anthropicJSONKind classifies the offending JSON value carried by a
+// json.UnmarshalTypeError. encoding/json reports the value as a kind word
+// ("string", "bool", "array", "object", "number"), except for numbers, which
+// would embed the literal value ("number 1.5") — so it is normalized to the
+// kind and the value is discarded.
+func anthropicJSONKind(value string) string {
+	switch {
+	case value == "string":
+		return "string"
+	case value == "bool":
+		return "boolean"
+	case value == "array":
+		return "array"
+	case value == "object":
+		return "object"
+	case value == "number" || strings.HasPrefix(value, "number "):
+		return "number"
+	default:
+		return "value"
+	}
+}
+
+// anthropicRequestID returns the client-supplied X-Request-ID when present,
+// sanitized for header and log safety, or generates one so every response can
+// be correlated with server-side error logs.
+func anthropicRequestID(r *http.Request) string {
+	if id := sanitizeRequestID(r.Header.Get("X-Request-ID")); id != "" {
+		return id
+	}
+	var seed [8]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return fmt.Sprintf("req_%d", time.Now().UnixNano())
+	}
+	return "req_" + hex.EncodeToString(seed[:])
+}
+
+// sanitizeRequestID strips control characters (including CR/LF, which would
+// otherwise corrupt response headers and log lines) and caps the length.
+func sanitizeRequestID(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		if r >= 0x20 && r <= 0x7e { // printable ASCII, including space
+			b.WriteRune(r)
+		}
+	}
+	clean := b.String()
+	if len(clean) > 128 {
+		clean = clean[:128]
+	}
+	return clean
+}
+
+// logAnthropicDecodeError records the full decode failure and request metadata
+// for server-side diagnosis. It never logs the Authorization or X-API-Key
+// headers, the raw body, the system prompt, or message content: the detail
+// comes from the error's Error(), which contains only field names, types, and
+// offsets.
+func logAnthropicDecodeError(r *http.Request, requestID string, err error) {
+	detail := err.Error()
+	cause := err
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		cause = unwrapped
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		detail = fmt.Sprintf("%s (go type %s)", detail, typeErr.Type)
+	}
+	log.Printf("anthropic: request %s: decode error: %T: %s: path=%s content-type=%q content-encoding=%q content-length=%d",
+		requestID, cause, detail, r.URL.Path, r.Header.Get("Content-Type"), r.Header.Get("Content-Encoding"), r.ContentLength)
+}
+
+// writeAnthropicDecodeError logs the failure and writes the standard Anthropic
+// invalid_request_error response with the redacted reason.
+func writeAnthropicDecodeError(w http.ResponseWriter, r *http.Request, requestID string, err error) {
+	logAnthropicDecodeError(r, requestID, err)
+	writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "invalid request body: "+err.Error())
+}
+
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	requestID := anthropicRequestID(r)
+	w.Header().Set("X-Request-ID", requestID)
 	if r.Method != http.MethodPost {
 		writeAnthropicErr(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
 
-	var req anthropicRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "invalid request body")
+	req, err := decodeAnthropicRequest(r)
+	if err != nil {
+		writeAnthropicDecodeError(w, r, requestID, err)
 		return
 	}
 	chatReq, err := req.chatRequest(requestTodoID(r, req.Metadata))
 	if err != nil {
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if s.gw == nil {
+		writeAnthropicErr(w, http.StatusServiceUnavailable, "api_error", "gateway is not configured")
 		return
 	}
 
@@ -114,13 +330,24 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMessagesCountTokens(w http.ResponseWriter, r *http.Request) {
+	requestID := anthropicRequestID(r)
+	w.Header().Set("X-Request-ID", requestID)
 	if r.Method != http.MethodPost {
 		writeAnthropicErr(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	var req anthropicRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "invalid request body")
+	req, err := decodeAnthropicRequest(r)
+	if err != nil {
+		writeAnthropicDecodeError(w, r, requestID, err)
+		return
+	}
+	// Reuse the /v1/messages semantic validation: a top-level null, an empty
+	// object, a missing model or messages, an illegal role, an unknown content
+	// block, or an invalid tool/image must all be rejected exactly like
+	// /v1/messages would. chatRequest is a pure conversion — it never touches
+	// the gateway and never uploads attachments.
+	if _, err := req.chatRequest(""); err != nil {
+		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	b, _ := json.Marshal(req)
@@ -185,12 +412,16 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 			chat.Messages = append(chat.Messages, converted)
 		case "user":
 			var text strings.Builder
+			var attachments []openai.AttachmentInput
 			flushText := func() {
-				if text.Len() == 0 {
+				if text.Len() == 0 && len(attachments) == 0 {
 					return
 				}
-				chat.Messages = append(chat.Messages, openai.ChatMessage{Role: "user", Content: text.String()})
+				chat.Messages = append(chat.Messages, openai.ChatMessage{
+					Role: "user", Content: text.String(), Attachments: attachments,
+				})
 				text.Reset()
+				attachments = nil
 			}
 			for _, block := range blocks {
 				switch block.Type {
@@ -201,7 +432,7 @@ func (r anthropicRequest) chatRequest(todoID string) (openai.ChatRequest, error)
 					if err != nil {
 						return openai.ChatRequest{}, fmt.Errorf("invalid image content: %w", err)
 					}
-					chat.Attachments = append(chat.Attachments, attachment)
+					attachments = append(attachments, attachment)
 					if text.Len() > 0 {
 						text.WriteString("\n\n")
 					}

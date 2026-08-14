@@ -160,8 +160,8 @@ func TestResponsesRequestConvertsInputImagesToAttachments(t *testing.T) {
 	if strings.Contains(content, "AAAA") {
 		t.Fatalf("data URL payload leaked into prompt: %q", content)
 	}
-	if len(chat.Attachments) != 1 || chat.Attachments[0].MIMEType != "image/png" || string(chat.Attachments[0].Data) != "\x00\x00\x00" {
-		t.Fatalf("attachments = %#v", chat.Attachments)
+	if len(chat.Messages[0].Attachments) != 1 || chat.Messages[0].Attachments[0].MIMEType != "image/png" || string(chat.Messages[0].Attachments[0].Data) != "\x00\x00\x00" {
+		t.Fatalf("attachments = %#v", chat.Messages[0].Attachments)
 	}
 }
 
