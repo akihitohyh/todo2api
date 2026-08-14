@@ -36,6 +36,51 @@ func TestHTTPErrorPreservesUpstreamDetails(t *testing.T) {
 	}
 }
 
+func TestClientsShareBoundedTransport(t *testing.T) {
+	first := New("https://example.test/api/v1", "first-key")
+	second := New("https://example.test/api/v1", "second-key")
+	if first.http.Transport != second.http.Transport {
+		t.Fatal("account clients did not share the upstream transport")
+	}
+	transport, ok := first.http.Transport.(*http.Transport)
+	if !ok || transport.MaxConnsPerHost <= 0 || transport.MaxConnsPerHost > 64 {
+		t.Fatalf("shared transport is not bounded: %#v", first.http.Transport)
+	}
+}
+
+func TestGetTodoDecodesStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/todos/todo-1" {
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(Todo{ID: "todo-1", ProjectID: "project-1", Status: "READY"})
+	}))
+	defer server.Close()
+
+	todo, err := New(server.URL+"/api/v1", "key").GetTodo(context.Background(), "todo-1")
+	if err != nil || todo.ID != "todo-1" || todo.Status != "READY" {
+		t.Fatalf("todo = %#v, err = %v", todo, err)
+	}
+}
+
+func TestHTTPErrorPreservesNestedDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":{"message":"Upstream HTTP/2 stream failed","code":"upstream_http2_stream_error"}}`)
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, "key").CreateTodo(context.Background(), "project-1", "hello", AgentSettings{})
+	var upstreamErr *HTTPError
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("error = %T %v, want *HTTPError", err, err)
+	}
+	if upstreamErr.Code != "upstream_http2_stream_error" || upstreamErr.Message != "Upstream HTTP/2 stream failed" {
+		t.Fatalf("nested HTTP error = %#v", upstreamErr)
+	}
+}
+
 func TestCreateAndAddMessageWireFormat(t *testing.T) {
 	var createBody, addBody map[string]any
 	var todoPostCount int

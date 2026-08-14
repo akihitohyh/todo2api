@@ -206,6 +206,24 @@ func TestResponsesRequestIgnoresEncryptedAgentMessageContent(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestIgnoresCompactionItems(t *testing.T) {
+	req := responsesRequest{
+		Model: "public-model",
+		Input: json.RawMessage(`[
+			{"type":"compaction","id":"cmp_1","encrypted_content":"opaque-state"},
+			{"type":"message","role":"user","content":"continue after compaction"}
+		]`),
+	}
+
+	chat, _, err := req.chatRequest("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Messages) != 1 || chat.Messages[0].Role != "user" || chat.Messages[0].Content != "continue after compaction" {
+		t.Fatalf("messages = %#v", chat.Messages)
+	}
+}
+
 func TestResponsesRequestConvertsNamespacedCallHistory(t *testing.T) {
 	req := responsesRequest{
 		Model: "public-model",
