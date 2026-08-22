@@ -1,3 +1,33 @@
+**本项目赞助商：[汪汪中转站](https://api.hyhawang.com/)：1 元 1 刀，GPT 低至 0.08x。**
+
+# AT Maker
+
+AT Maker 提供 CLI 和 WebUI，用于执行 OpenAI 账号注册流程，保存 ChatGPT access token，并尝试获取平台 OAuth refresh token。
+
+> [!CAUTION]
+> **使用、克隆、修改或分发本项目，即表示你已阅读并接受 [`NOTICE`](NOTICE) 的全部条款。**  
+> 本项目按 **现状（AS IS）** 提供，不附任何担保；作者和维护者不承担任何责任。  
+> **仅允许**用于你拥有的账号与环境、合法 CTF、明确授权且在范围内的安全研究、教学和离线源码研究。  
+> **明确禁止：**欺诈、批量造号转售、针对未授权目标的自动化、故意滥用平台或规避服务条款。  
+> 一切法律责任和使用后果由使用者独立承担。不接受这些条款时，请勿使用、请勿克隆，并删除所有副本。
+
+---
+
+## 法律边界
+
+| | |
+| --- | --- |
+| **允许** | 你自己的账号和环境；明确授权的安全研究；CTF、学术协议研究与教学；离线阅读源码 |
+| **禁止** | 欺诈、批量注册转售、账号黑产、对未授权目标的自动化、故意规避或滥用平台服务条款 |
+| **责任** | 账号封禁、额度损失、数据泄露、民事、刑事或行政后果均由使用者承担 |
+| **关联** | 本项目不隶属于 OpenAI / ChatGPT、Microsoft / Outlook、Cloudflare、TempMail.lol、YYDS Mail、chatgpt2api 上游或其他邮箱、验证码及代理服务商；上方披露的赞助关系不代表任何第三方平台认可或背书 |
+
+完整条款见 [`NOTICE`](NOTICE)。本项目采用 [MIT License](LICENSE)，但 **MIT License 并非完整免责声明**。
+
+如果你无法确定用途是否合法，请不要运行；请先咨询执业律师，或联系目标平台的安全与合规团队。
+
+---
+
 # todo2api
 
 OpenAI-compatible API gateway for [todofor.ai](https://todofor.ai), inspired by
@@ -333,3 +363,7 @@ a valid todofor.ai API key; use
 
 1. Persist session references across restarts and add authenticated resume tokens.
 2. Add broader compatibility for multimodal OpenAI message content.
+
+## 致谢
+
+<https://linux.do>
