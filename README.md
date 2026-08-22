@@ -1,9 +1,5 @@
 **本项目赞助商：[汪汪中转站](https://api.hyhawang.com/)：1 元 1 刀，GPT 低至 0.08x。**
 
-# AT Maker
-
-AT Maker 提供 CLI 和 WebUI，用于执行 OpenAI 账号注册流程，保存 ChatGPT access token，并尝试获取平台 OAuth refresh token。
-
 > [!CAUTION]
 > **使用、克隆、修改或分发本项目，即表示你已阅读并接受 [`NOTICE`](NOTICE) 的全部条款。**  
 > 本项目按 **现状（AS IS）** 提供，不附任何担保；作者和维护者不承担任何责任。  
